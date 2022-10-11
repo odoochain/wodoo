@@ -24,6 +24,11 @@ Provides functionalities:
 pipx install wodoo
 ```
 
+### install directly
+
+```bash
+pip install git+https://github.com/odoochain/wodoo
+```
 
 ### optional: To be not blocked when working on btrfs/zfs volumes and so, this is suggested on dev machines:
 
