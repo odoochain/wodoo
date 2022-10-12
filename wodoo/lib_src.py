@@ -16,8 +16,9 @@ from .tools import split_hub_url
 
 @cli.group(cls=AliasedGroup)
 @pass_config
-def src(config): 
+def src(config):
     pass
+
 
 @src.command(help="Create a new odoo")
 @click.argument("path", required=True)
@@ -42,6 +43,7 @@ def make_module(config, name, parent_path):
         name,
     )
 
+
 @src.command(name='update-ast')
 @click.option('-f', '--filename', required=False)
 def update_ast(filename):
@@ -50,6 +52,7 @@ def update_ast(filename):
     click.echo("Updating ast - can take about one minute")
     update_cache(filename or None)
     click.echo("Updated ast - took {} seconds".format((datetime.now() - started).seconds))
+
 
 @src.command('goto-inherited')
 @click.option('-f', '--filepath', required=True)
@@ -63,11 +66,13 @@ def goto_inherited(filepath, lineno):
     if filepath:
         print(f"FILEPATH:{filepath}:{lineno}")
 
+
 @src.command()
 @pass_config
 def rmpyc(config):
     for file in config.dirs['customs'].glob("**/*.pyc"):
         file.unlink()
+
 
 @src.command(name='show-addons-paths')
 def show_addons_paths():
@@ -75,7 +80,8 @@ def show_addons_paths():
     paths = get_odoo_addons_paths(relative=True)
     for path in paths:
         click.echo(path)
-        
+
+
 @src.command(name='make-modules', help="Puts all modules in /modules.txt")
 @pass_config
 def make_modules(config):
@@ -83,6 +89,7 @@ def make_modules(config):
     (config.dirs['customs'] / 'modules.txt').write_text(modules)
     click.secho(f"Updated /modules.txt with: \n\n", fg='yellow')
     click.secho(modules)
+
 
 @src.command(name="update-addons-path", help="Sets addons paths in manifest file. Can be edited there (order)")
 def update_addons_path():
@@ -105,6 +112,7 @@ def update_addons_path():
     m['addons_paths'] = current_paths
     m.rewrite()
 
+
 @src.command()
 @pass_config
 def setup_venv(config):
@@ -121,6 +129,8 @@ def setup_venv(config):
     click.secho("Please execute following commands in your shell:", bold=True)
     click.secho("source '{}'".format(venv_dir / 'bin' / 'activate'))
     click.secho("pip3 install cython")
-    click.secho("pip3 install -r https://raw.githubusercontent.com/odoo/odoo/{}/requirements.txt".format(current_version()))
-    requirements1 = Path(__file__).parent.parent / 'images' / 'odoo' / 'config' / str(current_version()) / 'requirements.txt'
+    click.secho(
+        "pip3 install -r https://raw.githubusercontent.com/odoo/odoo/{}/requirements.txt".format(current_version()))
+    requirements1 = Path(__file__).parent.parent / 'images' / 'odoo' / 'config' / str(
+        current_version()) / 'requirements.txt'
     click.secho("pip3 install -r {}".format(requirements1))

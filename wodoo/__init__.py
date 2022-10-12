@@ -73,13 +73,15 @@ pass_config = click.make_pass_decorator(Config, ensure=True)
     "-xs",
     "--restrict-setting",
     multiple=True,
-    help="Several parameters; limit to special configuration files settings and docker-compose files. All other configuration files will be ignored.",
+    help="Several parameters; limit to special configuration files settings and docker-compose files. All other "
+         "configuration files will be ignored.",
 )
 @click.option(
     "-xd",
     "--restrict-docker-compose",
     multiple=True,
-    help="Several parameters; limit to special configuration files settings and docker-compose files. All other configuration files will be ignored.",
+    help="Several parameters; limit to special configuration files settings and docker-compose files. All other "
+         "configuration files will be ignored.",
 )
 @click.option("-p", "--project-name", help="Set Project-Name")
 @click.option("--chdir", help="Set Working Directory")
@@ -163,7 +165,7 @@ from .tools import __dc  # NOQA
     "-x",
     "--execute",
     is_flag=True,
-    help=("Execute the script to insert completion into users rc-file."),
+    help="Execute the script to insert completion into users rc-file.",
 )
 def completion(execute):
     shell = os.environ["SHELL"].split("/")[-1]

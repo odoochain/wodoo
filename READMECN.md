@@ -28,6 +28,7 @@ pipx install wodoo
 ### optional: To be not blocked when working on btrfs/zfs volumes and so, this is suggested on dev machines:
 
 
+
 ```bash
 cat << 'EOF' > /etc/sudoers.d/odoo
 Cmnd_Alias ODOO_COMMANDS_ODOO = /usr/bin/find *, /var/lib/wodoo_env/bin/odoo *, /usr/bin/btrfs subvolume *, /usr/bin/mkdir *, /usr/bin/mv *, /usr/bin/rsync *, /usr/bin/rm *,  /usr/bin/du *, /usr/local/bin/odoo *, /usr/bin/btrfs subvol show *, /usr/sbin/gosu *
@@ -155,3 +156,13 @@ odoo pgactivity
 | ODOO_INSTALL_LIBPOSTAL=1| If set, then the libpostal lib is installed|
 | ODOO_QUEUEJOBS_CRON_IN_ONE_CONTAINER=1 | Runs queuejobs and cronjob in the odoo container where also the web application resides|
 | ODOO_QUEUEJOBS_CHANNELS=root:40,magento2:1 | Configures queues for queuejob module |
+
+## Bug 
+
+```
+ERROR: pip's dependency resolver does not currently take into account all the packages that are installed. This behaviour is the source of the following dependency conflicts.
+qiling 1.4.3 requires pyyaml>=6.0, but you have pyyaml 5.4.1 which is incompatible.
+poetry 1.2.0 requires jsonschema<5.0.0,>=4.10.0, but you have jsonschema 3.2.0 which is incompatible.
+web3 6.0.0b4 requires jsonschema<5,>=4.0.0, but you have jsonschema 3.2.0 which is incompatible.
+```
+
