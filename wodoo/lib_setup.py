@@ -7,16 +7,19 @@ from . import cli, pass_config
 from .lib_clickhelpers import AliasedGroup
 from . import Commands
 
+
 @cli.group(cls=AliasedGroup)
 @pass_config
 def setup(config):
     pass
 
+
 @setup.command()
 @pass_config
 @click.pass_context
 def show_effective_settings(ctx, config):
-    from . import MyConfigParser
+    from wodoo.myconfigparser import MyConfigParser
+    # from . import MyConfigParser
     config = MyConfigParser(config.files['settings'])
     for k in sorted(config.keys()):
         click.echo("{}={}".format(
@@ -40,10 +43,12 @@ def remove_web_assets(ctx, config):
     if current_version() <= 10.0:
         click.echo("Please login as admin, so that assets are recreated.")
 
+
 @setup.command()
 @pass_config
 def status(config):
     _status(config)
+
 
 def _status(config):
     color = 'yellow'
@@ -57,6 +62,7 @@ def _status(config):
         click.secho("url: ", nl=False)
         click.secho(f"http://localhost:{config.PROXY_PORT}", fg=color, bold=True)
 
+
 @setup.command(help="Upgrade wodoo")
 def upgrade():
     cmd = [
@@ -64,6 +70,7 @@ def upgrade():
         "wodoo", '-U'
     ]
     subprocess.check_call(cmd)
+
 
 @setup.command()
 @click.argument("lines")
@@ -73,5 +80,5 @@ def produce_test_lines(lines):
     for i in range(lines):
         click.secho(lorem.paragraph())
 
-Commands.register(status)
 
+Commands.register(status)

@@ -1,13 +1,17 @@
-import traceback
-import arrow
-import threading
-from tabulate import tabulate
-import time
 import collections
-import grp
+import time
+import traceback
+
+import arrow
+from tabulate import tabulate
+
+# import grp  # https://github.com/celery/celery/pull/6804/files
+try:
+    import grp
+    import pwd
+except ImportError:
+    grp = pwd = None
 import base64
-import pwd
-from contextlib import contextmanager
 import platform
 from pathlib import Path
 import importlib.util
@@ -31,7 +35,6 @@ from .tools import abort
 from .tools import _get_version
 from . import cli, pass_config, Commands
 from .lib_clickhelpers import AliasedGroup
-from .odoo_config import MANIFEST
 from .tools import execute_script
 
 
@@ -246,7 +249,6 @@ def _do_compose(config, db="", demo=False, **forced_values):
     """
     builds docker compose, proxy settings, setups odoo instances
     """
-    from .myconfigparser import MyConfigParser
     from .settings import _export_settings
 
     rows = []
@@ -612,6 +614,7 @@ def post_process_complete_yaml_config(config, yml):
     return yml
 
 
+# https://github.com/search?l=Python&o=desc&q=subprocess.check_output+docker+compose+env&s=indexed&type=Code
 def __run_docker_compose_config(config, contents, env):
     import yaml
 
@@ -638,9 +641,12 @@ def __run_docker_compose_config(config, contents, env):
         d.update(env)
 
         # set current user id and docker group for probable dinds
+        # https://github.com/bentoml/BentoML/blob/35cd25c043ae5c85c622f99654df6a67dadf6cbb/src/bentoml/_internal/utils/buildx.py
+        if grp is None:
+            return
         d["DOCKER_GROUP_ID"] = str(grp.getgrnam("docker").gr_gid)
 
-        conf = subprocess.check_output(cmdline, cwd=temp_path, env=d)
+        conf = subprocess.check_output(cmdline, stderr=subprocess.STDOUT, cwd=temp_path, env=d).decode('utf-8').strip()
         conf = yaml.safe_load(conf)
         return conf
 
@@ -705,7 +711,6 @@ def dict_merge(dct, merge_dct):
 
 def _prepare_docker_compose_files(config, dest_file, paths):
     from .myconfigparser import MyConfigParser
-    from .tools import abort
     import yaml
 
     if not dest_file:
@@ -755,7 +760,6 @@ def _explode_referenced_machines(contents):
     a service is referenced; this service is copied in its own file to match later that reference by its service
     name in docker compose config
     """
-    import yaml
 
     needs_explosion = {}
 
@@ -819,8 +823,9 @@ def toggle_settings(ctx, config):
         click.echo("Please run as root:")
         click.echo("sudo -E odoo toggle")
         sys.exit(1)
-    from . import MyConfigParser
+    # from . import MyConfigParser
 
+    from wodoo.myconfigparser import MyConfigParser
     myconfig = MyConfigParser(config.files["settings"])
     config_local = MyConfigParser(config.files["settings_etc_default_file"])
 
@@ -857,8 +862,6 @@ def toggle_settings(ctx, config):
 
 
 def _use_file(config, path):
-    from . import odoo_config
-
     def check():
         if "etc" in path.parts:
             return True

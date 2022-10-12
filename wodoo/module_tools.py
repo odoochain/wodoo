@@ -377,7 +377,7 @@ def make_customs(path):
 
 def get_template_dir():
     path = Path(os.path.expanduser("~/.odoo/templates"))
-    url = "https://github.com/marcwimmer/wodoo-templates"
+    url = "https://gitee.com/paddlelaw/paddlelaw-templates"
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
         subprocess.check_call(["git", "clone", url, path])
