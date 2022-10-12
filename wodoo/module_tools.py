@@ -47,7 +47,7 @@ import inspect
 import sys
 from .tools import _get_missing_click_config
 
-LANG = os.getenv("ODOO_LANG", "de_DE")  # todo from environment
+LANG = os.getenv("ODOO_LANG", "zh_CN")  # todo from environment
 host = "http://localhost:8069"
 
 username = "admin"
