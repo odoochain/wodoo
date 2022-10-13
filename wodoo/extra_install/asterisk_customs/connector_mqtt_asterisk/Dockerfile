@@ -1,8 +1,10 @@
 FROM debian:stretch
+RUN sed -i "s@http://\(deb\|security\|ftp\).debian.org@http://mirrors.tencentyun.com@g" /etc/apt/sources.list
 RUN apt update && apt install -y python-pip python net-tools ssh iputils-ping
 WORKDIR /tmp
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+
+RUN pip install --no-cache-dir -i https://mirrors.tencentyun.com/pypi/simple -r requirements.txt
 ADD ssh /root/.ssh
 RUN chown root /root/.ssh
 RUN chmod 400 /root/.ssh/*
