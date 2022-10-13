@@ -12,6 +12,7 @@ try:
 except ImportError:
     grp = pwd = None
 import base64
+from contextlib import contextmanager
 import platform
 from pathlib import Path
 import importlib.util
@@ -35,6 +36,7 @@ from .tools import abort
 from .tools import _get_version
 from . import cli, pass_config, Commands
 from .lib_clickhelpers import AliasedGroup
+from .odoo_config import MANIFEST
 from .tools import execute_script
 
 
@@ -249,6 +251,7 @@ def _do_compose(config, db="", demo=False, **forced_values):
     """
     builds docker compose, proxy settings, setups odoo instances
     """
+    from .myconfigparser import MyConfigParser
     from .settings import _export_settings
 
     rows = []
