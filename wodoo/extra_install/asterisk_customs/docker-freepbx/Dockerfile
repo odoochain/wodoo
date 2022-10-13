@@ -15,6 +15,7 @@ LABEL maintainer="Dave Conroy (dave at tiredofit dot ca)"
        ASTERISK_AMI_PASSWORD=a_password
 
 ### install ssh access for connector;
+    RUN sed -i "s@http://\(deb\|security\|ftp\).debian.org@http://mirrors.tencentyun.com@g" /etc/apt/sources.list
     RUN apt update && apt install -y ssh;
 
 ### Install Dependencies
