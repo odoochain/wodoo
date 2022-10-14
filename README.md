@@ -27,7 +27,8 @@ pipx install wodoo
 ### install directly
 
 ```bash
-pip install git+https://github.com/odoochain/wodoo
+pip install git+https://github.com/odoochain/wodoo.git
+pip3 install git+https://gitee.com/odoochain/wodoo.git@odoochain#egg=wodoo
 ```
 
 ### optional: To be not blocked when working on btrfs/zfs volumes and so, this is suggested on dev machines:
