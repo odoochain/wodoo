@@ -826,9 +826,9 @@ def toggle_settings(ctx, config):
         click.echo("Please run as root:")
         click.echo("sudo -E odoo toggle")
         sys.exit(1)
-    # from . import MyConfigParser
+    from .myconfigparser import MyConfigParser
 
-    from wodoo.myconfigparser import MyConfigParser
+    # from wodoo.myconfigparser import MyConfigParser
     myconfig = MyConfigParser(config.files["settings"])
     config_local = MyConfigParser(config.files["settings_etc_default_file"])
 
