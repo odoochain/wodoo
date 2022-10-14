@@ -28,6 +28,7 @@ def db(config):
         f"in ram: {config.run_postgres_in_ram}"
     ))
 
+
 @db.command()
 @pass_config
 def db_health_check(config):
@@ -37,13 +38,14 @@ def db_health_check(config):
     ))
     try:
         _execute_sql(conn,
-        "select * from pg_catalog.pg_tables;", fetchall=True)
+                     "select * from pg_catalog.pg_tables;", fetchall=True)
     except Exception:  # pylint: disable=broad-except
         abort("Listing tables failed for connection to {conn.host}")
     else:
         click.secho((
             'Success'
         ), fg='green')
+
 
 @db.command()
 @click.argument('dbname', required=True)
@@ -56,6 +58,7 @@ def drop_db(config, dbname):
     _remove_postgres_connections(
         conn, sql_afterwards=f"drop database {dbname};")
     click.echo(f"Database {dbname} dropped.")
+
 
 @db.command()
 @pass_config
@@ -74,9 +77,10 @@ def pgactivity(config):
         '-U', conn.user,
         '-d', conn.dbname,
         '-h', conn.host,
-        ], env={
-            "PGPASSWORD": conn.pwd,
-        }, interactive=True)
+    ], env={
+        "PGPASSWORD": conn.pwd,
+    }, interactive=True)
+
 
 @db.command()
 @click.argument('dbname', required=False)
@@ -99,6 +103,7 @@ def pgcli(config, dbname, params, host, port, user, password):
         conn = config.get_odoo_conn(inside_container=True).clone(dbname=dbname)
     return _pgcli(config, conn, params, use_docker_container=True)
 
+
 @db.command()
 @click.argument('dbname', required=False)
 @click.argument('params', nargs=-1)
@@ -109,6 +114,7 @@ def psql(config, dbname, params, sql, non_interactive):
     dbname = dbname or config.dbname
     conn = config.get_odoo_conn(inside_container=True).clone(dbname=dbname)
     return _psql(config, conn, params, sql=sql, interactive=not non_interactive)
+
 
 def _psql(config, conn, params, bin='psql', sql=None, use_docker_container=None, interactive=True):
     dbname = conn.dbname
@@ -137,13 +143,15 @@ def _psql(config, conn, params, bin='psql', sql=None, use_docker_container=None,
             })
         else:
             subprocess.call([
-                exec_file_in_path(bin),
-            ] + cmd, env={"PGPASSWORD": conn.pwd})
+                                exec_file_in_path(bin),
+                            ] + cmd, env={"PGPASSWORD": conn.pwd})
     finally:
         os.environ['PGPASSWORD'] = ""
 
+
 def _pgcli(config, conn, params, use_docker_container=None):
     _psql(config, conn, params, bin='pgcli', use_docker_container=use_docker_container)
+
 
 @db.command(name='reset-odoo-db')
 @click.argument('dbname', required=False)
@@ -184,6 +192,7 @@ def reset_db(ctx, config, dbname, do_not_install_base, collatec):
             non_interactive=True,
         )
 
+
 @db.command()
 @pass_config
 @click.pass_context
@@ -210,6 +219,7 @@ def anonymize(ctx, config):
             'env.cr.commit()',
         ],
     )
+
 
 @db.command()
 @click.option("--no-update", is_flag=True)
@@ -252,6 +262,7 @@ def cleardb(ctx, config, no_update):
         ],
     )
 
+
 @db.command(name='setname')
 @click.argument("DBNAME", required=True)
 @click.pass_context
@@ -272,6 +283,7 @@ def db_size(ctx, config):
         size = rows[0][0]
     click.secho("---")
     click.secho(size)
+
 
 @db.command(name='show-table-sizes')
 @pass_config
@@ -333,6 +345,7 @@ ORDER BY total_bytes DESC;
     click.echo(tabulate(rows, [
         "TABLE_NAME", "row_estimate", "total", 'INDEX', 'toast', 'TABLE']))
 
+
 @db.command(help="Export as excel")
 @click.argument("sql", required=True)
 @click.option('-f', '--file')
@@ -378,6 +391,7 @@ def excel(config, sql, file, base64):
         cmd = f'chown {config.owner_uid}:{config.owner_uid} "{filepath}"'
         os.system(cmd)
 
+
 @db.command()
 @click.option('--no-scram', is_flag=True)
 @pass_config
@@ -407,13 +421,13 @@ def pghba_conf_wide_open(config, no_scram):
             conn, (
                 "delete from hba "
                 "where lines like 'host%all%all%all%md5'"
-        ))
+            ))
         for method in ['trust', 'scram', 'md5']:
             _execute_sql(
                 conn, (
                     "delete from hba "
                     f"where lines like 'host%all%all%all%{method}'"
-            ))
+                ))
 
         def trustline():
             if config.devmode:
@@ -426,7 +440,8 @@ def pghba_conf_wide_open(config, no_scram):
             _execute_sql(
                 conn, (
                     f"insert into hba(lines) values('{trustline}');"
-            ))
+                ))
+
         trustline()
 
         _execute_sql(conn, f"copy hba to '{pghba_conf}';")
@@ -468,7 +483,7 @@ def pghba_conf_wide_open(config, no_scram):
             conn, (
                 "delete from hba "
                 "where lines like '%password_encryption%'"
-        ))
+            ))
         _execute_sql(conn, (
             "update hba set lines = replace(lines, '\t', ' ')"
         ))
@@ -479,7 +494,7 @@ def pghba_conf_wide_open(config, no_scram):
                     "values ('"
                     f"password_encryption=md5"
                     "');"
-            ))
+                ))
         _execute_sql(conn, f"copy hba to '{conf}';")
         _execute_sql(conn, "select pg_reload_conf();")
         _execute_sql(conn, "drop table hba")
@@ -496,11 +511,8 @@ def pghba_conf_wide_open(config, no_scram):
                 continue
             print(x[0])
 
-
     adapt_pghba_conf()
     adapt_postgres_conf()
-
-
 
 
 Commands.register(reset_db, 'reset-db')
