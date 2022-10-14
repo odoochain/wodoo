@@ -18,8 +18,8 @@ def setup(config):
 @pass_config
 @click.pass_context
 def show_effective_settings(ctx, config):
-    from wodoo.myconfigparser import MyConfigParser
-    # from . import MyConfigParser
+    # from wodoo.myconfigparser import MyConfigParser
+    from .myconfigparser import MyConfigParser
     config = MyConfigParser(config.files['settings'])
     for k in sorted(config.keys()):
         click.echo("{}={}".format(
