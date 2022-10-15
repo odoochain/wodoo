@@ -40,3 +40,4 @@ repos
 .idea
 .dev
 /dev/roam.md
+/dev/wsl.py
