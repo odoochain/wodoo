@@ -38,3 +38,5 @@ dist
 repos
 .vscode
 .idea
+.dev
+/dev/roam.md

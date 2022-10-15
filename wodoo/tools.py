@@ -606,7 +606,7 @@ if retry:
 
 
 def _file2env(filepath, out_dict=None):
-    from . import MyConfigParser
+    from .myconfigparser import MyConfigParser
 
     if not filepath.exists():
         return
@@ -833,7 +833,6 @@ def get_dockercompose():
 
 def get_volume_names():
     from . import project_name
-
     vols = get_dockercompose()["volumes"].keys()
     return [f"{project_name}_{x}" for x in vols]
 

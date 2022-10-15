@@ -3,6 +3,7 @@ import tempfile
 import shutil
 from pathlib import Path
 
+
 class ProgramSettings(object):
     def __init__(self, filename):
         self.filename = Path(filename)
