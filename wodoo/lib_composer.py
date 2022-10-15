@@ -1,3 +1,4 @@
+# _*_ coding:utf_8 _*_
 import collections
 import time
 import traceback
