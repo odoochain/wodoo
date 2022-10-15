@@ -1,3 +1,4 @@
+
 from pathlib import Path
 import subprocess
 import inquirer
@@ -74,7 +75,7 @@ def rmpyc(config):
         file.unlink()
 
 
-@src.command(name='show-addons-paths')
+@src.command(name='show-addons-paths', help="Show addons paths")
 def show_addons_paths():
     from .odoo_config import get_odoo_addons_paths
     paths = get_odoo_addons_paths(relative=True)

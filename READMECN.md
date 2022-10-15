@@ -18,6 +18,8 @@ Provides functionalities:
 
 ## How to install
 
+首先 docker system prune
+
 ### Install minimum
 
 ```bash

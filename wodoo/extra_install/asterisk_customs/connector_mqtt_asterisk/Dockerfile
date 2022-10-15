@@ -4,7 +4,8 @@ RUN apt update && apt install -y python-pip python net-tools ssh iputils-ping
 WORKDIR /tmp
 COPY requirements.txt ./
 
-RUN pip install --no-cache-dir -i https://mirrors.tencentyun.com/pypi/simple -r requirements.txt
+RUN pip config set global.index-url http://mirrors.tencentyun.com/pypi/simple
+RUN pip install --no-cache-dir --trusted-host mirrors.tencentyun.com -r requirements.txt
 ADD ssh /root/.ssh
 RUN chown root /root/.ssh
 RUN chmod 400 /root/.ssh/*
