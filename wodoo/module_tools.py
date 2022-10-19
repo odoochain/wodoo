@@ -678,7 +678,7 @@ class Modules(object):
             """
             Returns a list of full paths of all manifests
             """
-            for path in get_odoo_addons_paths():
+            for path in reversed(get_odoo_addons_paths()):
                 for file in path.glob("*/" + manifest_file_names()):
                     modname = file.parent.name
                     if modname in modnames:
@@ -1095,7 +1095,6 @@ class Module(object):
 
     @property
     def hash(self):
-        import pudb;pudb.set_trace()
         from .tools import get_directory_hash
 
         return get_directory_hash(self.path)

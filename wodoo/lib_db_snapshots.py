@@ -57,7 +57,7 @@ def __choose_snapshot(config, take=False):
 @pass_config
 def do_list(config):
     config.snapshot_manager.assert_environment(config)
-    snapshots = config.snapshot_manager.__get_snapshots(config)
+    snapshots = list(config.snapshot_manager.__get_snapshots(config))
     from tabulate import tabulate
 
     rows = [(x["name"], x["date"], x["path"]) for x in snapshots]
@@ -115,6 +115,7 @@ def snapshot_clear_all(ctx, config):
     if snapshots:
         for snap in snapshots:
             config.snapshot_manager.remove(config, snap)
+    config.snapshot_manager.clear_all(config)
     ctx.invoke(do_list)
 
 

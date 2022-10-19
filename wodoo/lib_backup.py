@@ -112,8 +112,18 @@ def backup_all(ctx, config, filename):
     "--compression",
     default=5,
 )
+@click.option("-j", "--worker", default=1)
 def backup_db(
-    ctx, config, filename, dbname, dumptype, column_inserts, exclude, pigz, compression
+    ctx,
+    config,
+    filename,
+    dbname,
+    dumptype,
+    column_inserts,
+    exclude,
+    pigz,
+    compression,
+    worker,
 ):
     filename = Path(
         filename or f"{config.project_name}.{config.dbname}.odoo" + ".dump.gz"
@@ -172,6 +182,8 @@ def backup_db(
             dumptype,
             "--compression",
             str(compression),
+            "-j",
+            str(worker),
         ]
         for exclude in exclude:
             cmd += ["--exclude", exclude]
@@ -319,6 +331,14 @@ def _restore_wodoo_bin(ctx, config, filepath, verify):
 @click.option(
     "--verify", default=False, is_flag=True, help="Wodoo-bin: checks postgres version"
 )
+@click.option(
+    "-X",
+    "--exclude-tables",
+    multiple=True,
+    help="Exclude tables from restore like --exclude=mail_message",
+)
+@click.option("-v", "--verbose", is_flag=True)
+@click.option("--ignore-errors", is_flag=True, help="Example if some extensions are missing (replication)")
 @pass_config
 @click.pass_context
 def restore_db(
@@ -329,6 +349,9 @@ def restore_db(
     no_remove_webassets,
     verify,
     workers,
+    exclude_tables,
+    verbose,
+    ignore_errors,
 ):
     if not filename:
         filename = _inquirer_dump_file(
@@ -458,6 +481,17 @@ def restore_db(
                     "-j",
                     str(workers),
                 ]
+                if ignore_errors:
+                    cmd += [
+                        "--ignore-errors"
+                    ]
+                if exclude_tables:
+                    cmd += [
+                        "--exclude-tables",
+                        ",".join(exclude_tables),
+                    ]
+                if verbose:
+                    cmd += ["--verbose"]
                 __dc(cmd)
             else:
                 _add_cronjob_scripts(config)["postgres"]._restore(

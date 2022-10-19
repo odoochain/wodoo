@@ -6,6 +6,7 @@ zfs create zfs_pool1/docker/volumes
 set /etc/odoo/settings ZFS_PATH_VOLUMES=zfs_pool1/docker/volumes  then
 
 """
+import inquirer
 from .tools import abort
 from operator import itemgetter
 import subprocess
@@ -84,7 +85,6 @@ def _get_possible_snapshot_paths(config):
     """
     all_zfs_folders = _get_all_zfs()
     zfs_path = _get_zfs_path(config)
-    root_zfs_path = "/".join(zfs_path.split("/")[:-1])
     for folder in all_zfs_folders:
         if folder == zfs_path:
             yield folder
@@ -139,19 +139,25 @@ def _get_snapshots(config):
     yield from sorted(_get_snaps(), key=lambda x: x["date"], reverse=True)
 
 
+_cache = {}
+
+
 def _get_all_zfs():
-    zfs = search_env_path("zfs")
-    folders = subprocess.check_output(
-        ["sudo", zfs, "list"], encoding="utf8"
-    ).splitlines()
-    folders = list(map(lambda x: x.split(" ")[0], folders))
-    return folders
+    if "folders" not in _cache:
+        zfs = search_env_path("zfs")
+        output = subprocess.check_output(
+            ["sudo", zfs, "list", "-oname"], encoding="utf8"
+        ).splitlines()
+        folders = map(lambda x: x.strip(), output)
+        folders = list(map(lambda x: x.strip(), folders))
+        _cache["folders"] = folders
+    return _cache["folders"]
 
 
 def __is_zfs_fs(path_zfs):
     assert " " not in path_zfs
     folders = _get_all_zfs()
-    folders = [x for x in folders if x.split(" ")[0] == path_zfs]
+    folders = [x for x in folders if x == path_zfs]
     return folders
 
 
@@ -173,6 +179,9 @@ def _turn_into_subvolume(config):
     filename = fullpath.parent / Path(tempfile.mktemp()).name
     if filename.exists():
         raise Exception(f"Path {filename} should not exist.")
+    if not fullpath.exists():
+        abort(f"{fullpath} does not exist. Did you start postgres? (odoo up -d)")
+
     shutil.move(fullpath, filename)
     try:
         subprocess.check_output(["sudo", zfs, "create", fullpath_zfs])
@@ -195,16 +204,21 @@ def _turn_into_subvolume(config):
 def make_snapshot(ctx, config, name):
     zfs = search_env_path("zfs")
     __dc(["stop", "-t 1"] + ["postgres"])
-    path = _get_path(config)
     _turn_into_subvolume(config)
     snapshots = list(_get_snapshots(config))
     snapshot = list(filter(lambda x: x["name"] == name, snapshots))
     if snapshot:
-        if config.force:
-            subprocess.check_call(["sudo", zfs, "destroy", snapshot[0]["fullpath"]])
-        else:
-            click.secho(f"Snapshot {name} already exists.", fg="red")
-            sys.exit(-1)
+        if not config.force:
+            answer = inquirer.prompt(
+                [
+                    inquirer.Confirm(
+                        "continue", message=("Snapshot already exists - overwrite?")
+                    )
+                ]
+            )
+            if not answer["continue"]:
+                sys.exit(-1)
+        subprocess.check_call(["sudo", zfs, "destroy", snapshot[0]["fullpath"]])
 
     assert " " not in name
     fullpath = _get_zfs_path(config) + "@" + name
@@ -213,9 +227,21 @@ def make_snapshot(ctx, config, name):
     return name
 
 
+def _try_umount(config):
+    zfs_full_path = _get_zfs_path(config)
+    umount = search_env_path("umount")
+    try:
+        subprocess.check_call(
+            ["sudo", umount, zfs_full_path],
+        )
+    except subprocess.CalledProcessError:
+        click.secho(
+            f"Could not umount {zfs_full_path}. Perhaps not a problem.", fg="yellow"
+        )
+
+
 def restore(config, name):
     zfs = search_env_path("zfs")
-    umount = search_env_path("umount")
     if not name:
         return
 
@@ -242,16 +268,14 @@ def restore(config, name):
         subprocess.check_call(["sudo", zfs, "rollback", snapshot["fullpath"]])
     else:
         full_next_path = _get_next_snapshotpath(config)
-        subprocess.check_call(
-            ["sudo", umount, zfs_full_path],
-        )
+        _try_umount(config)
         subprocess.check_call(["sudo", zfs, "rename", zfs_full_path, full_next_path])
         subprocess.check_call(
             [
                 "sudo",
                 zfs,
                 "clone",
-                full_next_path + "@" + snapshot["name"],
+                snapshot["fullpath"],
                 zfs_full_path,
             ]
         )
@@ -269,6 +293,7 @@ def remove(config, snapshot):
             sys.exit(-1)
         snapshot = snapshots[0]
     if snapshot["fullpath"] in map(itemgetter("fullpath"), snapshots):
+        _try_umount(config)
         subprocess.check_call(["sudo", zfs, "destroy", "-R", snapshot["fullpath"]])
 
 
@@ -283,3 +308,11 @@ def remove_volume(config):
             pass
         subprocess.check_call(["sudo", zfs, "destroy", "-R", path])
         click.secho(f"Removed: {path}", fg="yellow")
+    clear_all(config)
+
+
+def clear_all(config):
+    zfs = search_env_path("zfs")
+    zfs_full_path = _get_zfs_path(config)
+    _try_umount(config)
+    subprocess.check_call(["sudo", zfs, "destroy", "-r", zfs_full_path])
