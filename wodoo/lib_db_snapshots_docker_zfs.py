@@ -38,6 +38,7 @@ systemctl start docker
 
 DOCKER_VOLUMES = Path("/var/lib/docker/volumes")
 
+zfs = search_env_path("zfs")
 
 class NotZFS(Exception):
     def __init__(self, msg, poolname):
@@ -62,7 +63,11 @@ def _get_zfs_path(config):
     if not config.ZFS_PATH_VOLUMES:
         abort(
             "Please configure the snapshot root folder for docker "
-            "snapshots in ZFS_PATH_VOLUMES"
+            "snapshots in ZFS_PATH_VOLUMES.\n"
+            "Example: pool1/docker/volumes\n"
+            "You must make sure that a filesystem exists for docker/volumes."
+            "If poolname is pool1 and mounted on /var/lib/docker you do: \n"
+            "zfs create pool1/volumes\n"
         )
     path = config.ZFS_PATH_VOLUMES + "/" + __get_postgres_volume_name(config)
     return path
@@ -105,8 +110,6 @@ def __get_snapshots(config):
 
 
 def _get_snapshots(config):
-    zfs = search_env_path("zfs")
-
     def _get_snaps():
         for path in _get_possible_snapshot_paths(config):
             for line in (
@@ -144,7 +147,6 @@ _cache = {}
 
 def _get_all_zfs():
     if "folders" not in _cache:
-        zfs = search_env_path("zfs")
         output = subprocess.check_output(
             ["sudo", zfs, "list", "-oname"], encoding="utf8"
         ).splitlines()
@@ -155,6 +157,7 @@ def _get_all_zfs():
 
 
 def __is_zfs_fs(path_zfs):
+    path_zfs = str(path_zfs)
     assert " " not in path_zfs
     folders = _get_all_zfs()
     folders = [x for x in folders if x == path_zfs]
@@ -169,6 +172,8 @@ def _turn_into_subvolume(config):
     """
     Makes a zfs pool out of a path.
     """
+    if config.NAMED_ODOO_POSTGRES_VOLUME:
+        abort("Not compatible with NAMED_ODOO_POSTGRES_VOLUME by now.")
     zfs = search_env_path("zfs")
     fullpath = _get_path(config)
     fullpath_zfs = _get_zfs_path(config)
@@ -310,9 +315,21 @@ def remove_volume(config):
         click.secho(f"Removed: {path}", fg="yellow")
     clear_all(config)
 
+def _get_pool_mountpoint(poolname):
+    mountpoint = subprocess.check_output(["sudo", zfs, "get", "mountpoint", "-H",  "-o", "value", poolname], encoding="utf8").strip()
+    return Path(mountpoint)
+
+def translate_poolPath_to_fullPath(path):
+    path = Path(path)
+    pool = path.parts[0]
+    poolpath = _get_pool_mountpoint(pool)
+    path = poolpath / path.relative_to(pool)
+    return path
 
 def clear_all(config):
     zfs = search_env_path("zfs")
     zfs_full_path = _get_zfs_path(config)
     _try_umount(config)
-    subprocess.check_call(["sudo", zfs, "destroy", "-r", zfs_full_path])
+    diskpath = translate_poolPath_to_fullPath(zfs_full_path)
+    if __is_zfs_fs(diskpath):
+        subprocess.check_call(["sudo", zfs, "destroy", "-r", zfs_full_path])
