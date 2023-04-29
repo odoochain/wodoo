@@ -7,7 +7,7 @@ import tempfile
 import click
 from .tools import __dc
 from .tools import search_env_path
-from . import cli, pass_config
+from .cli import cli, pass_config
 from .lib_clickhelpers import AliasedGroup
 from pathlib import Path
 
@@ -92,6 +92,8 @@ def _turn_into_subvolume(path):
         ):
             click.secho(f"Turning {path} into a subvolume.")
             filename = path.parent / Path(tempfile.mktemp()).name
+            if filename.exists():
+                raise Exception(f"Path {filename} should not exist.")
             shutil.move(path, filename)
             try:
                 subprocess.check_output(["sudo", "btrfs", "subvolume", "create", path])
@@ -115,9 +117,9 @@ def _turn_into_subvolume(path):
         return
 
 
-def make_snapshot(config, name):
+def make_snapshot(ctx, config, name):
     volume_name = __get_postgres_volume_name(config)
-    __dc(["stop", "-t 1"] + ["postgres"])
+    __dc(config, ["stop", "-t 1"] + ["postgres"])
     path = _get_subvolume_dir(config)
     _turn_into_subvolume(DOCKER_VOLUMES / __get_postgres_volume_name(config))
 
@@ -139,7 +141,7 @@ def make_snapshot(config, name):
             str(dest_path),
         ]
     ).decode("utf-8").strip()
-    __dc(["up", "-d"] + ["postgres"])
+    __dc(config, ["up", "-d"] + ["postgres"])
     return name
 
 
@@ -155,7 +157,7 @@ def restore(config, name):
         click.secho(f"Path {name} does not exist.", fg="red")
         sys.exit(-1)
 
-    __dc(["stop", "-t 1"] + ["postgres"])
+    __dc(config, ["stop", "-t 1"] + ["postgres"])
     volume_path = DOCKER_VOLUMES / __get_postgres_volume_name(config)
     if volume_path.exists():
         subprocess.check_call(
@@ -169,8 +171,8 @@ def restore(config, name):
         _get_cmd_butter_volume() + ["snapshot", name, str(volume_path)]
     )
 
-    __dc(["rm", "-f"] + ["postgres"])
-    __dc(["up", "-d"] + ["postgres"])
+    __dc(config, ["rm", "-f"] + ["postgres"])
+    __dc(config, ["up", "-d"] + ["postgres"])
 
 
 def remove(config, snapshot):
@@ -190,6 +192,7 @@ def remove(config, snapshot):
             ]
         )
 
+
 def purge_inactive(config):
     for vol in SNAPSHOT_DIR.glob("*"):
         if not vol.is_dir():
@@ -198,15 +201,9 @@ def purge_inactive(config):
             next(DOCKER_VOLUMES.glob(vol.name))
         except StopIteration:
             for snapshot in vol.glob("*"):
-                click.secho(f"Deleting snapshot {snapshot}", fg='red')
+                click.secho(f"Deleting snapshot {snapshot}", fg="red")
                 subprocess.check_call(
-                    [
-                        "sudo",
-                        "btrfs",
-                        "subvolume",
-                        "delete",
-                        str(snapshot)
-                    ]
+                    ["sudo", "btrfs", "subvolume", "delete", str(snapshot)]
                 )
-            click.secho(f"Deleting {vol}", fg='red')
+            click.secho(f"Deleting {vol}", fg="red")
             shutil.rmtree(vol)

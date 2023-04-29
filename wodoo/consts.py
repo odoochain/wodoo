@@ -1,5 +1,6 @@
 from pathlib import Path
-from .init_functions import _search_path
+from .tools import _search_path
+
 VERSIONS = [7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0]
 YAML_VERSION = '3.7'
 DEFAULT_IMAGES_REPO = "https://github.com/marcwimmer/wodoo-images"
@@ -28,6 +29,8 @@ default_dirs = {
 default_files = {
     'after_reload_script': "/usr/local/bin/after-odoo-reload.sh",
     'after_up_script': "/usr/local/bin/after-odoo-up.sh",
+    'odoo_config_file_additions': "~/.odoo/odoo.config",
+    'odoo_config_file_additions.project': "~/.odoo/odoo.config.${project_name}",
     'project_settings': "~/.odoo/settings.${project_name}",
     'project_docker_compose.home': "~/.odoo/docker-compose.yml",
     'project_docker_compose.home.project': "~/.odoo/docker-compose.${project_name}.yml",
@@ -50,6 +53,7 @@ default_files = {
     'native_collected_requirements_from_modules': "${run_native_bin_dir}/customs-requirements.txt",
     'start-dev': '~/.odoo/start-dev',
     'cicd_delegator_registry': '${cicd_delegator}/registry.json',
+    'pgcli_history': '${run}/pgcli_history',
 }
 
 default_commands = {

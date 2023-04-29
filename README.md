@@ -21,27 +21,11 @@ Provides functionalities:
 ### Install minimum
 
 ```bash
-# as root:
-python3 -m venv /var/lib/wodoo_env
-. /var/lib/wodoo_env/bin/activate
-python3 -mpip install wheel
-python3 -mpip install gimera
-python3 -mpip install wodoo
+pipx install wodoo
 ```
 
-### Make global executable **odoo** command
 
-
-```bash
-cat << 'EOF' > /usr/local/sbin/odoo
-#!/bin/bash
-sudo -E /var/lib/wodoo_env/bin/odoo "$@"
-EOF
-
-chmod a+x /usr/local/sbin/odoo
-```
-
-### optional: To be not blocked when working on btrfs volumes and so, this is suggested on dev machines:
+### optional: To be not blocked when working on btrfs/zfs volumes and so, this is suggested on dev machines:
 
 
 ```bash
@@ -162,8 +146,47 @@ odoo pgactivity
 | HUB_URL=value| user:password@host:port/paths.. to configure|
 | REGISTRY=1      | Rewrites all build and images urls to HUB_URL. Should be used on production systems to force pull only from registry and block any local buildings.|
 | POSTGRES_VERSION=13| Choose from 11, 12, 13, 14|
-| ENABLE_DB_MANAGER| Enables the odoo db manager|
+| ODOO_ENABLE_DB_MANAGER| Enables the odoo db manager|
 | DEVMODE=1 | At restore runs safety scripts to disable cronjobs and mailserver and resets passwords|
 | RUN_PROXY=1| If the built-in nodejs proxy is enabled |
 | RUN_PROXY_PUBLISHED=0/1| If the proxy is reachable from outside the docker network example from 127.0.0.1:8069|
 | PROXY_PORT| The port on which you can access with plain http the odoo|
+| ODOO_IMAGES_BRANCH| The branch used for ~/.odoo/images|
+| ODOO_INSTALL_LIBPOSTAL=1| If set, then the libpostal lib is installed|
+| ODOO_QUEUEJOBS_CRON_IN_ONE_CONTAINER=1 | Runs queuejobs and cronjob in the odoo container where also the web application resides|
+| ODOO_QUEUEJOBS_CHANNELS=root:40,magento2:1 | Configures queues for queuejob module |
+|NAMED_ODOO_POSTGRES_VOLUME| Use a specific external volume; not dropped with down -v command|
+|CRONJOB_DADDY_CLEANUP=0 */1 * * * ${JOB_DADDY_CLEANUP}|Turn on grandfather-principle based backup|
+|RESTART_CONTAINERS=1|Sets "restart unless-stopped" policy|
+
+## Odoo Server Configuration in ~/.odoo/settings/odoo.config and odoo.config.${PROJECT_NAME}
+
+Contents will be appended to [options] section of standard odoo configuration.
+
+Configuration may simple look like:
+
+
+```
+setting1=value1
+```
+
+or like that:
+
+```
+[options]
+setting1=value1
+
+[queue_job]
+settingqj=valueqj
+```
+
+The [options] is prepended automatically if missed.
+
+
+# Pytests
+
+Best executed with:
+
+```bash
+time sudo -E pytest
+```

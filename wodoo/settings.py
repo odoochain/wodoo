@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 from contextlib import contextmanager
 from .odoo_config import MANIFEST
+from .tools import whoami
 
 def _get_settings_files(config):
     """
@@ -44,12 +45,7 @@ def _export_settings(config, forced_values):
     # constants
     settings = MyConfigParser(config.files['settings'])
     if 'OWNER_UID' not in settings.keys():
-        UID = int(os.getenv("SUDO_UID", os.getuid()))
-        if not UID:
-            # sometimes (in ansible) SUDO_UID is set to 0 but env USER exists
-            if os.getenv("USER") and os.environ['USER'] != 'root':
-                UID = getpwnam(os.environ['USER']).pw_uid
-        settings['OWNER_UID'] = str(UID)
+        settings['OWNER_UID'] = whoami(id=True)
 
     # forced values:
     for k, v in forced_values.items():
@@ -67,7 +63,7 @@ def _collect_settings_files(config, quiet=False):
         # optimize
         for filename in config.dirs['images'].glob("**/default.settings"):
             _files.append(config.dirs['images'] / filename)
-    if config.restrict['settings']:
+    if config.restrict.get('settings'):
         _files += config.restrict['settings']
     else:
         for dir in filter(lambda x: x.exists(), _get_settings_files(config)):

@@ -1,3 +1,6 @@
+from multiprocessing.dummy import Process
+import time
+import re
 import sys
 import uuid
 import arrow
@@ -15,23 +18,38 @@ import tempfile
 import click
 
 from wodoo.robo_helpers import _get_required_odoo_modules_from_robot_file
+from .tools import is_git_clean
 from .tools import get_hash
 from .tools import get_directory_hash
 from .tools import sync_folder
 from .tools import __dcrun
 from .tools import __cmd_interactive
 from .tools import __get_installed_modules
-from . import cli, pass_config, Commands
+from .tools import __concurrent_safe_write_file
+from .cli import cli, pass_config, Commands
 from .lib_clickhelpers import AliasedGroup
 from .tools import _execute_sql
 from .tools import get_services
 from .tools import __try_to_set_owner
 from .tools import measure_time, abort
+from .tools import _update_setting
+from .tools import _get_setting
+from .tools import get_git_hash
+from .module_tools import _determine_affected_modules_for_ir_field_and_related
 from pathlib import Path
+
+DTF = "%Y-%m-%d %H:%M:%S"
+KEY_SHA_REVISION = "sha.revision"
 
 
 class UpdateException(Exception):
     pass
+
+
+class RepeatUpdate(Exception):
+    def __init__(self, affected_modules):
+        super().__init__(str(affected_modules))
+        self.affected_modules = affected_modules
 
 
 @cli.group(cls=AliasedGroup)
@@ -67,7 +85,7 @@ def update_module_file(module):
     from .module_tools import Module
 
     for module in module:
-        Module.get_by_name(module).update_module_file()
+        Module.get_by_name(module, nocache=True).update_module_file()
 
 
 @odoo_module.command(name="run-tests")
@@ -122,7 +140,9 @@ def run_tests(ctx, config):
                 params = ["odoo", "/odoolib/unit_test.py", f"{file}"]
                 click.secho(f"Running test: {file}", fg="yellow", bold=True)
                 res = __dcrun(
-                    params + ["--log-level=error", "--not-interactive"], returncode=True
+                    config,
+                    params + ["--log-level=error", "--not-interactive"],
+                    returncode=True,
                 )
                 if res:
                     failed.append(file)
@@ -132,7 +152,7 @@ def run_tests(ctx, config):
                         bold=True,
                     )
                     res = __cmd_interactive(
-                        *(["run", "--rm"] + params + ["--log-level=debug"])
+                        config, *(["run", "--rm"] + params + ["--log-level=debug"])
                     )
                 else:
                     success.append(file)
@@ -199,16 +219,28 @@ def _get_outdated_versioned_modules_of_deptree(modules):
 
     """
     from .module_tools import Modules, DBModules, Module
+    from .module_tools import NotInAddonsPath
     from .odoo_config import MANIFEST
 
     mods = Modules()
+    cache_db_modules = {}
 
-    for module in modules:
+    for module in sorted(modules):
         if module == "base":
             continue
 
-        for dep in mods.get_module_flat_dependency_tree(Module.get_by_name(module)):
-            meta_info = DBModules.get_meta_data(dep.name)
+        try:
+            mod = Module.get_by_name(module)
+        except (KeyError, NotInAddonsPath):
+            click.secho(
+                f"Warning module not found: {module}",
+                fg="yellow",
+            )
+            continue
+        for dep in mods.get_module_flat_dependency_tree(mod):
+            if dep.name not in cache_db_modules:
+                cache_db_modules[dep.name] = DBModules.get_meta_data(dep.name)
+            meta_info = cache_db_modules[dep.name]
             if not meta_info:
                 continue
             version = meta_info["version"]
@@ -227,119 +259,67 @@ def _get_outdated_versioned_modules_of_deptree(modules):
             new_version = tuple([int(x) for x in new_version.split(".")])
             if len(new_version) == 2:
                 # add odoo version in front
-                new_version = tuple(
-                    [int(x) for x in str(MANIFEST()["version"]).split(".")]
-                    + list(new_version)
-                )
+                odoo_version = str(MANIFEST()["version"]).split(".")
+                assert (
+                    len(odoo_version) == 2
+                ), f"Version in manifest should be like 16.0 not '{odoo_version}'"
+                new_version = tuple(list(map(int, odoo_version)) + list(new_version))
+                del odoo_version
 
             if new_version > version:
                 yield dep
 
 
-@odoo_module.command()
-@click.argument("migration-file", required=True)
-@click.argument("mode", required=True)
-@click.option("--allow-serie", is_flag=True)
-@click.option("--force-version")
-@pass_config
-@click.pass_context
-def marabunta(ctx, config, migration_file, mode, allow_serie, force_version):
-    click.secho(
-        """
-            _.._.-..-._
-        .-'  .'  /\\  \\`._
-        /    /  .'  `-.\\  `.
-            :_.'  ..    :       _.../\\
-            |           ;___ .-'   //\\\\.
-            \\  _..._  /    `/\\   //  \\\\\\
-            `-.___.-'  /\\ //\\\\       \\\\:
-                |    //\\V/ :\\\\       \\\\
-                    \\      \\\\/  \\\\      /\\\\
-                    `.____.\\\\   \\\\   .'  \\\\
-                    //   /\\\\---\\\\-'     \\\\
-                fsc  //   // \\\\   \\\\       \\\\
-    """,
-        fg="red",
-    )
+def _get_available_modules(ctx, param, incomplete):
+    from .odoo_config import MANIFEST
 
-    click.secho("=================================", fg="yellow")
-    click.secho("MARABUNTA", fg="yellow")
-    click.secho("=================================", fg="yellow")
-    params = [
-        "--migration-file",
-        "/opt/src/" + migration_file,
-        "--database",
-        config.dbname,
-        "--db-user",
-        config.db_user,
-        "--db-password",
-        config.db_pwd,
-        "--db-port",
-        config.db_port,
-        "--db-host",
-        config.db_host,
-        "--mode",
-        mode,
-    ]
-    if allow_serie:
-        params += ["--allow-serie"]
-    if force_version:
-        params += ["--force-version", force_version]
-
-    params = ["run", "odoo", "/usr/local/bin/marabunta"] + params
-    return __cmd_interactive(*params)
+    try:
+        manifest = MANIFEST()
+        if not manifest:
+            raise Exception("no manifest")
+    except:
+        return []
+    modules = manifest["install"]
+    if incomplete:
+        modules = [x for x in modules if incomplete in x]
+    return sorted(modules)
 
 
-@odoo_module.command(
-    help=("If menu items are missing, then recomputing the parent store" "can help")
+@odoo_module.command(name="UPDATE")
+@click.option(
+    "--no-dangling-check",
+    default=False,
+    is_flag=True,
+    help="Not checking for dangling modules",
 )
-@pass_config
-@click.pass_context
-def recompute_parent_store(ctx, config):
-    if config.use_docker:
-        from .lib_control_with_docker import shell as lib_shell
-
-    click.secho("Recomputing parent store...", fg="blue")
-    lib_shell(
-        (
-            "for model in self.env['ir.model'].search([]):\n"
-            "   try:\n"
-            "       obj = self.env[model.model]\n"
-            "   except KeyError: pass\n"
-            "   else:\n"
-            "       obj._parent_store_compute()\n"
-            "       env.cr.commit()\n"
-        )
-    )
-    click.secho("Recompute parent store done.", fg="green")
-
-
-@odoo_module.command(
-    help=(
-        "As the name says: if db was transferred, web-icons are restored"
-        " on missing assets"
-    )
+@click.option("--non-interactive", "-I", is_flag=True, help="Not interactive")
+@click.option(
+    "--recover-view-error",
+    is_flag=True,
+    help="Can happen if per update fields are removed and views still referencing this field.",
 )
+@click.option("--i18n", default=False, is_flag=True, help="Overwrite Translations")
 @pass_config
 @click.pass_context
-def restore_web_icons(ctx, config):
-    if config.use_docker:
-        from .lib_control_with_docker import shell as lib_shell
-
-    click.secho("Restoring web icons...", fg="blue")
-    lib_shell(
-        (
-            "for x in self.env['ir.ui.menu'].search([]):\n"
-            "   if not x.web_icon: continue\n"
-            "   x.web_icon_data = x._compute_web_icon_data(x.web_icon)\n"
-            "   env.cr.commit()\n"
-        )
+def update2(ctx, config, no_dangling_check, non_interactive, recover_view_error, i18n):
+    conn = config.get_odoo_conn()
+    revision = _get_setting(conn, KEY_SHA_REVISION)
+    Commands.invoke(
+        ctx,
+        "update",
+        no_outdated_modules=True,
+        since_git_sha=revision,
+        no_dangling_check=no_dangling_check,
+        non_interactive=non_interactive,
+        recover_view_error=recover_view_error,
+        i18n=i18n,
     )
-    click.secho("Restored web icons.", fg="green")
 
 
 @odoo_module.command()
-@click.argument("module", nargs=-1, required=False)
+@click.argument(
+    "module", nargs=-1, required=False, shell_complete=_get_available_modules
+)
 @click.option(
     "--since-git-sha",
     "-i",
@@ -368,9 +348,7 @@ def restore_web_icons(ctx, config):
     is_flag=True,
     help="Does not install/update module list module",
 )
-@click.option(
-    "--non-interactive", "-I", default=True, is_flag=True, help="Not interactive"
-)
+@click.option("--non-interactive", "-I", is_flag=True, help="Not interactive")
 @click.option(
     "--check-install-state",
     default=True,
@@ -404,6 +382,34 @@ def restore_web_icons(ctx, config):
 @click.option(
     "--uninstall", is_flag=True, help="Executes just uninstallation of modules."
 )
+@click.option(
+    "--test-tags",
+    help="e.g. at_install/account_accountant,post_install/account_accountant",
+)
+@click.option(
+    "-l",
+    "--log",
+    default="info",
+    type=click.Choice(["test", "info", "debug", "error"]),
+    help="display logs with given level",
+)
+@click.option(
+    "-dt",
+    "--default-test-tags",
+    is_flag=True,
+    help="Adds at_install/{module},post_install/{module},standard/{module}",
+)
+@click.option(
+    "--recover-view-error",
+    is_flag=True,
+    help="Can happen if per update fields are removed and views still referencing this field.",
+)
+@click.option(
+    "-O",
+    "--no-outdated-modules",
+    is_flag=True,
+    help="dont check for outdated modules (for migrations suitable)",
+)
 @pass_config
 @click.pass_context
 def update(
@@ -422,10 +428,15 @@ def update(
     no_restart=True,
     i18n=False,
     tests=False,
+    test_tags=False,
+    default_test_tags=False,
     config_file=False,
     server_wide_modules=False,
     additional_addons_paths=False,
     uninstall=False,
+    log=False,
+    recover_view_error=False,
+    no_outdated_modules=False,
 ):
     """
     Just custom modules are updated, never the base modules (e.g. prohibits adding old stock-locations)
@@ -440,7 +451,13 @@ def update(
 
 
     """
+
     param_module = module
+
+    if recover_view_error and not non_interactive:
+        abort(
+            "Recover view error requires non interactive execution (stdout parse required)"
+        )
 
     click.secho(
         (
@@ -451,7 +468,6 @@ def update(
     )
     click.secho(
         """
-
            _                               _       _
           | |                             | |     | |
   ___   __| | ___   ___    _   _ _ __   __| | __ _| |_ ___
@@ -464,8 +480,11 @@ def update(
         fg="green",
     )
     from .module_tools import Modules, DBModules, Module
+    from .odoo_config import MANIFEST
 
-    # ctx.invoke(module_link)
+    if test_tags and default_test_tags:
+        abort("Conflict: parameter test-tags and default-test-tags")
+
     if config.run_postgres:
         Commands.invoke(ctx, "up", machines=["postgres"], daemon=True)
         Commands.invoke(ctx, "wait_for_container_postgres", missing_ok=True)
@@ -474,37 +493,24 @@ def update(
         if since_git_sha and module:
             raise Exception("Conflict: since-git-sha and modules")
         if since_git_sha:
-            module = list(_get_changed_modules(since_git_sha))
-
-            # filter modules to defined ones in MANIFEST
-            click.secho(f"Following modules change since last sha: {' '.join(module)}")
-            from .odoo_config import MANIFEST
-
-            module = list(filter(lambda x: x in MANIFEST()["install"], module))
-            click.secho(
-                (
-                    "Following modules change since last sha "
-                    f"(filtered to manifest): {' '.join(module)}"
-                )
-            )
+            module = _get_modules_since_git_sha(since_git_sha)
 
             if not module:
                 click.secho("No module update required - exiting.")
                 return
         else:
-            module = list(
-                filter(lambda x: x, sum(map(lambda x: x.split(","), module), []))
-            )  # '1,2 3' --> ['1', '2', '3']
+            module = _parse_modules(module)
 
         if not module and not since_git_sha:
             module = _get_default_modules_to_update()
 
-        outdated_modules = list(
-            map(
-                lambda x: x.name,
-                set(_get_outdated_versioned_modules_of_deptree(module)),
+        def _get_outdated_modules():
+            return list(
+                map(
+                    lambda x: x.name,
+                    set(_get_outdated_versioned_modules_of_deptree(module)),
+                )
             )
-        )
 
         if not no_restart:
             if config.use_docker:
@@ -515,40 +521,8 @@ def update(
                     Commands.invoke(ctx, "up", machines=["postgres"], daemon=True)
                 Commands.invoke(ctx, "wait_for_container_postgres")
 
-        def show_dangling():
-            dangling = list(DBModules.get_dangling_modules())
-            if dangling:
-                click.echo("Displaying dangling modules:")
-                for row in dangling:
-                    click.echo("{}: {}".format(row[0], row[1]))
-            return bool(dangling)
-
         if not no_dangling_check:
-            if any(x[1] == "uninstallable" for x in DBModules.get_dangling_modules()):
-                for x in DBModules.get_dangling_modules():
-                    click.echo("{}: {}".format(*x[:2]))
-                if (
-                    non_interactive
-                    or input(
-                        (
-                            "Uninstallable modules found - "
-                            "shall I set them to 'uninstalled'? [y/N]"
-                        )
-                    ).lower()
-                    == "y"
-                ):
-                    _execute_sql(
-                        config.get_odoo_conn(),
-                        (
-                            "update ir_module_module set state = "
-                            "'uninstalled' where state = 'uninstallable';"
-                        ),
-                    )
-            if DBModules.get_dangling_modules() and not dangling_modules:
-                if not no_dangling_check:
-                    if show_dangling():
-                        input("Abort old upgrade and continue? (Ctrl+c to break)")
-                        ctx.invoke(abort_upgrade)
+            _do_dangling_check(ctx, config, dangling_modules, non_interactive)
         if installed_modules:
             module += __get_installed_modules(config)
         if dangling_modules:
@@ -557,11 +531,19 @@ def update(
         if not module:
             raise Exception("no modules to update")
 
+        def _effective_test_tags():
+            if default_test_tags:
+                return ",".join(
+                    f"at_install/{x},post_install{x},standard/{x}" for x in module
+                )
+            else:
+                return test_tags or ""
+
         click.echo("Run module update")
         if config.odoo_update_start_notification_touch_file_in_container:
             Path(
                 config.odoo_update_start_notification_touch_file_in_container
-            ).write_text(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            ).write_text(datetime.now().strftime(DTF))
 
         def _technically_update(modules):
             try:
@@ -583,16 +565,35 @@ def update(
                     params += ["--i18n"]
                 if not tests:
                     params += ["--no-tests"]
+                if _effective_test_tags():
+                    params += ["--test-tags=" + _effective_test_tags()]
                 if server_wide_modules:
                     params += ["--server-wide-modules", server_wide_modules]
                 if additional_addons_paths:
                     params += ["--additional-addons-paths", additional_addons_paths]
+                if log:
+                    params += [f"--log={log}"]
                 params += ["--config-file=" + config_file]
-                rc = _exec_update(config, params)
+                rc = list(_exec_update(config, params, non_interactive=non_interactive))
+                if len(rc) == 1:
+                    rc = rc[0]
+                else:
+                    rc, output = rc
+
                 if rc:
-                    raise UpdateException(module)
+                    if recover_view_error:
+                        try:
+                            _try_to_recover_view_error(config, output)
+                        except RepeatUpdate as ex:
+                            _technically_update(ex.affected_modules)
+                        except Exception as ex:
+                            raise UpdateException(module) from ex
+                    else:
+                        raise UpdateException(module)
 
             except UpdateException:
+                raise
+            except RepeatUpdate:
                 raise
             except Exception as ex:
                 click.echo(traceback.format_exc())
@@ -601,9 +602,26 @@ def update(
                     ("Error at /update_modules.py - " "aborting update process.")
                 ) from ex
 
-        if outdated_modules:
-            _technically_update(outdated_modules)
-        _technically_update(module)
+        trycount = 0
+        max_try_count = 5
+        while True:
+            trycount += 1
+            try:
+                if not no_outdated_modules:
+                    outdated_modules = _get_outdated_modules()
+                    if outdated_modules:
+                        click.secho(
+                            f"Outdated modules: {','.join(outdated_modules)}",
+                            fg="yellow",
+                        )
+                        _technically_update(outdated_modules)
+                _technically_update(module)
+            except RepeatUpdate:
+                click.secho("Retrying update.")
+                if trycount >= max_try_count:
+                    raise
+            else:
+                break
 
         if not no_restart and config.use_docker:
             Commands.invoke(ctx, "restart", machines=["odoo"])
@@ -619,44 +637,8 @@ def update(
                 config.odoo_update_start_notification_touch_file_in_container
             ).write_text("0")
 
-    def _uninstall_marked_modules():
-        """
-        Checks for file "uninstall" in customs root and sets modules to uninstalled.
-        """
-        from .odoo_config import MANIFEST
-
-        if float(config.odoo_version) < 11.0:
-            return
-        # check if something is todo
-        to_uninstall = MANIFEST().get("uninstall", [])
-        to_uninstall = [x for x in to_uninstall if DBModules.is_module_installed(x)]
-        if to_uninstall:
-            click.secho(
-                "Going to uninstall {}".format(", ".join(to_uninstall)), fg="red"
-            )
-
-            if config.use_docker:
-                from .lib_control_with_docker import shell as lib_shell
-            for module in to_uninstall:
-                click.secho(f"Uninstall {module}", fg="red")
-                lib_shell(
-                    (
-                        "self.env['ir.module.module'].search(["
-                        f"('name', '=', '{module}'),"
-                        "('state', 'in', "
-                        "['to upgrade', 'to install', 'installed']"
-                        ")]).module_uninstall()\n"
-                        "self.env.cr.commit()"
-                    )
-                )
-
-        to_uninstall = [x for x in to_uninstall if DBModules.is_module_installed(x)]
-        if to_uninstall:
-            abort(f"Failed to uninstall: {','.join(to_uninstall)}")
-
     if not uninstall:
         _perform_install(module)
-    _uninstall_marked_modules()
 
     all_modules = (
         not param_module
@@ -664,27 +646,182 @@ def update(
         and param_module[0] in ["all", "base", False, None, ""]
     )
 
+    if uninstall or all_modules:
+        _uninstall_marked_modules(config, MANIFEST().get("uninstall", []))
+
     # check danglings
     if not no_dangling_check and all_modules:
         ctx.invoke(show_install_state, suppress_error=False)
 
     if check_install_state:
-        if all_modules:
-            ctx.invoke(
-                show_install_state,
-                suppress_error=no_dangling_check,
-                missing_as_error=True,
+        _do_check_install_state(ctx, config, module, all_modules, no_dangling_check)
+
+    _set_sha(config)
+
+
+def _set_sha(config):
+    conn = config.get_odoo_conn()
+    try:
+        sha = get_git_hash()
+    except:
+        pass
+    else:
+        _update_setting(conn, KEY_SHA_REVISION, sha)
+
+
+def _try_to_recover_view_error(config, output):
+    """
+    If a field is removed it can be that views still reference it, so
+    remove the item from the view.
+
+    Field "product_not_show_ax_code" does not exist in model "res.company"
+
+    Field "dummy1" does not exist in model "res.partner"
+
+    View error context:
+    {'file': '/opt/src/odoo/addons/module_respartner_dummyfield2/partnerview.xml',
+    'line': 3,
+    'name': 'res.partner form',
+    'view': ir.ui.view(545,),
+    'view.model': 'res.partner',
+    'view.parent': ir.ui.view(128,),
+    'xmlid': 'view_res_partner_form'}
+
+    Caution: this view is just the one that updates; the conflicting view is not listed.
+    Just a select statement is created by the other view.
+    """
+    lines = output.splitlines()
+
+    for i, line in enumerate(lines):
+        match = re.findall('Field "([^"]*?)" does not exist in model "([^"]*?)"', line)
+        if match:
+            field, model = match[0]
+            affected_modules = _determine_affected_modules_for_ir_field_and_related(
+                config, field, model
             )
-        else:
-            missing = list(DBModules.check_if_all_modules_from_install_are_installed())
-            problem_missing = set()
-            for module in module:
-                if module in missing:
-                    problem_missing.add(module)
-            if problem_missing:
-                for missing in sorted(problem_missing):
-                    click.secho("Missing: {missing}", fg="red")
-                abort("Missing after installation")
+            raise RepeatUpdate(affected_modules)
+
+
+def show_dangling():
+    from .module_tools import Modules, DBModules, Module
+
+    dangling = list(DBModules.get_dangling_modules())
+    if dangling:
+        click.echo("Displaying dangling modules:")
+        for row in dangling:
+            click.echo("{}: {}".format(row[0], row[1]))
+    return bool(dangling)
+
+
+def _do_check_install_state(ctx, config, module, all_modules, no_dangling_check):
+    from .module_tools import Modules, DBModules, Module
+
+    if all_modules:
+        ctx.invoke(
+            show_install_state,
+            suppress_error=no_dangling_check,
+            missing_as_error=True,
+        )
+    else:
+        missing = list(DBModules.check_if_all_modules_from_install_are_installed())
+        problem_missing = set()
+        for module in module:
+            if module in missing:
+                problem_missing.add(module)
+        if problem_missing:
+            for missing in sorted(problem_missing):
+                click.secho(f"Missing: {missing}", fg="red")
+            abort("Missing after installation")
+
+
+def _do_dangling_check(ctx, config, dangling_modules, non_interactive):
+    from .module_tools import Modules, DBModules, Module
+
+    if any(x[1] == "uninstallable" for x in DBModules.get_dangling_modules()):
+        if non_interactive:
+            abort("Danling modules exist. Provide --no-dangling-check otherwise.")
+        for x in DBModules.get_dangling_modules():
+            click.echo("{}: {}".format(*x[:2]))
+        if (
+            non_interactive
+            or input(
+                (
+                    "Uninstallable modules found - "
+                    "shall I set them to 'uninstalled'? [y/N]"
+                )
+            ).lower()
+            == "y"
+        ):
+            _execute_sql(
+                config.get_odoo_conn(),
+                (
+                    "update ir_module_module set state = "
+                    "'uninstalled' where state = 'uninstallable';"
+                ),
+            )
+    if DBModules.get_dangling_modules() and not dangling_modules:
+        if show_dangling() and not non_interactive:
+            input("Abort old upgrade and continue? (Ctrl+c to break)")
+            ctx.invoke(abort_upgrade)
+
+
+def _parse_modules(modules):
+    if isinstance(modules, (str, bytes)):
+        modules = modules.split(",")
+    modules = list(
+        filter(lambda x: x, sum(map(lambda x: x.split(","), modules), []))
+    )  # '1,2 3' --> ['1', '2', '3']
+    return modules
+
+
+@odoo_module.command()
+@click.argument("modules", nargs=-1, required=False)
+@pass_config
+@click.pass_context
+def uninstall(ctx, config, modules):
+    modules = _parse_modules(modules)
+    _uninstall_marked_modules(config, modules)
+
+
+def _uninstall_marked_modules(config, modules):
+    """
+    Checks for file "uninstall" in customs root and sets modules to uninstalled.
+    """
+    from .module_tools import Modules, DBModules, Module
+
+    assert not isinstance(modules, str)
+
+    if not modules:
+        return
+
+    if float(config.odoo_version) < 11.0:
+        return
+    modules = [x for x in modules if DBModules.is_module_installed(x)]
+    if not modules:
+        return
+    click.secho(f"Going to uninstall {','.join(modules)}", fg="red")
+
+    if config.use_docker:
+        from .lib_control_with_docker import shell as lib_shell
+
+    for module in modules:
+        click.secho(f"Uninstall {module}", fg="red")
+        lib_shell(
+            config,
+            (
+                "self.env['ir.module.module'].search(["
+                f"('name', '=', '{module}'),"
+                "('state', 'in', "
+                "['to upgrade', 'to install', 'installed']"
+                ")]).module_uninstall()\n"
+                "self.env.cr.commit()"
+            ),
+        )
+        del module
+
+    modules = [x for x in modules if DBModules.is_module_installed(x)]
+    if modules:
+        abort(f"Failed to uninstall: {','.join(modules)}")
 
 
 @odoo_module.command(name="update-i18n", help="Just update translations")
@@ -714,7 +851,9 @@ def update_i18n(ctx, config, module, no_restart):
         params += ["--no-update-modulelist"]
         params += ["--no-dangling-check"]
         params += ["--only-i18n"]
-        _exec_update(config, params)
+        retcode = next(_exec_update(config, params, non_interactive=True))
+        if retcode:
+            raise Exception("Error at update i18n happened.")
     except Exception:
         click.echo(traceback.format_exc())
         ctx.invoke(show_install_state, suppress_error=True)
@@ -722,20 +861,6 @@ def update_i18n(ctx, config, module, no_restart):
 
     if not no_restart:
         Commands.invoke(ctx, "restart", machines=["odoo"])
-
-
-@odoo_module.command()
-@pass_config
-def progress(config):
-    """
-    Displays installation progress
-    """
-    for row in _execute_sql(
-        config.get_odoo_conn(),
-        "select state, count(*) from ir_module_module group by state;",
-        fetchall=True,
-    ):
-        click.echo("{}: {}".format(row[0], row[1]))
 
 
 @odoo_module.command(name="show-install-state")
@@ -756,7 +881,7 @@ def show_install_state(config, suppress_error=False, missing_as_error=False):
 
     if not suppress_error:
         if dangling or (missing_as_error and missing):
-            raise Exception(
+            abort(
                 (
                     "Dangling modules detected - "
                     " please fix installation problems and retry! \n"
@@ -775,13 +900,6 @@ def show_addons_paths():
         click.echo(path)
 
 
-@odoo_module.command(name="pretty-print-manifest")
-def pretty_print_manifest():
-    from .odoo_config import MANIFEST
-
-    MANIFEST().rewrite()
-
-
 @odoo_module.command(name="show-conflicting-modules")
 def show_conflicting_modules():
     from .odoo_config import get_odoo_addons_paths
@@ -789,14 +907,26 @@ def show_conflicting_modules():
     get_odoo_addons_paths()
 
 
-def _exec_update(config, params):
-    if config.use_docker:
-        params = ["run", "odoo_update", "/update_modules.py"] + params
-        return __cmd_interactive(*params)
+def _exec_update(config, params, non_interactive=False):
+    params = ["odoo_update", "/update_modules.py"] + params
+    if not non_interactive:
+        yield __cmd_interactive(
+            config,
+            *(
+                [
+                    "run",
+                    "--rm",
+                ]
+                + params
+            ),
+        )
     else:
-        from . import lib_control_native
-
-        return lib_control_native._update_command(config, params)
+        try:
+            returncode, output = __dcrun(config, list(params), returnproc=True)
+            yield returncode
+            yield output
+        except subprocess.CalledProcessError as ex:
+            yield ex.returncode
 
 
 def _get_available_robottests(ctx, param, incomplete):
@@ -843,7 +973,9 @@ def _get_available_robottests(ctx, param, incomplete):
     is_flag=True,
     help=("If set, then a json is printed to console, with detailed informations"),
 )
-@click.option("--results-file", help="concrete filename where the results.json is stored")
+@click.option(
+    "--results-file", help="concrete filename where the results.json is stored"
+)
 @pass_config
 @click.pass_context
 def robotest(
@@ -894,7 +1026,10 @@ def robotest(
     if odoo_modules:
 
         def not_installed(module):
-            return DBModules.get_meta_data(module)["state"] == "uninstalled"
+            data = DBModules.get_meta_data(module)
+            if not data:
+                abort(f"Could not get state for {module}")
+            return data["state"] == "uninstalled"
 
         modules_to_install = list(filter(not_installed, odoo_modules))
         if modules_to_install:
@@ -934,7 +1069,7 @@ def robotest(
 
         return params
 
-    token = str(uuid.uuid4())
+    token = arrow.get().strftime("%Y-%m-%d_%H%M%S_") + str(uuid.uuid4())
     data = json.dumps(
         {
             "test_files": list(map(str, filenames)),
@@ -952,14 +1087,19 @@ def robotest(
     workingdir = customs_dir() / (Path(os.getcwd()).relative_to(customs_dir()))
     os.chdir(workingdir)
 
-    __dcrun(params, pass_stdin=data.decode("utf-8"), interactive=True)
+    __dcrun(config, params, pass_stdin=data.decode("utf-8"), interactive=True)
 
     output_path = config.HOST_RUN_DIR / "odoo_outdir" / "robot_output"
     from .robo_helpers import _eval_robot_output
 
     _eval_robot_output(
-        config, output_path, started, output_json, token, rm_tokendir=not keep_token_dir,
-        results_file=results_file
+        config,
+        output_path,
+        started,
+        output_json,
+        token,
+        rm_tokendir=not keep_token_dir,
+        results_file=results_file,
     )
 
 
@@ -969,9 +1109,8 @@ def _get_unittests_from_module(module_name):
 
     testfiles = []
     module = Module.get_by_name(module_name)
-    parent_dir = MANIFEST_FILE().parent
     for _file in module.path.glob("tests/test*.py"):
-        testfiles.append(_file.relative_to(parent_dir))
+        testfiles.append(_file)
     return testfiles
 
 
@@ -1019,9 +1158,10 @@ def list_robot_test_files(config):
 @click.option("-n", "--non-interactive", is_flag=True)
 @click.option("-t", "--tags", is_flag=True)
 @click.option("--output-json", is_flag=True)
+@click.option("--log", is_flag=True)
 @pass_config
 def unittest(
-    config, file, remote_debug, wait_for_remote, non_interactive, output_json, tags
+    config, file, remote_debug, wait_for_remote, non_interactive, output_json, tags, log
 ):
     """
     Collects unittest files and offers to run
@@ -1033,11 +1173,14 @@ def unittest(
     if file and "/" not in file:
         try:
             module = Module.get_by_name(file)
+
+            # walk to root - otherwise the files are not found
+            os.chdir(customs_dir())
         except Exception:
             pass
         else:
             tests = module.path.glob("tests/test*")
-            file = ",".join(map(lambda x: str(x.relative_to(customs_dir())), tests))
+            file = ",".join(map(lambda x: str(x), tests))
 
     todo = []
     if file:
@@ -1085,9 +1228,13 @@ def unittest(
 
     results_filename = next(tempfile._get_candidate_names())
     params += ["--resultsfile", f"/opt/out_dir/{results_filename}"]
+    if log:
+        params += ["--log-level=debug"]
+    else:
+        params += ["--log-level=info"]
 
     try:
-        __dcrun(params + ["--log-level=debug"], interactive=interactive)
+        __dcrun(config, params, interactive=interactive)
     except subprocess.CalledProcessError:
         pass
 
@@ -1096,12 +1243,12 @@ def unittest(
         abort("No testoutput generated - seems to be a technical problem.")
     test_result = json.loads(output_path.read_text())
     output_path.unlink()
+    passed = [x for x in test_result if not x["rc"]]
+    errors = [x for x in test_result if x["rc"]]
     if output_json:
         click.secho("---")
         click.secho(json.dumps(test_result, indent=4))
     else:
-        passed = [x for x in test_result if not x["rc"]]
-        errors = [x for x in test_result if x["rc"]]
         from tabulate import tabulate
 
         if passed:
@@ -1112,37 +1259,8 @@ def unittest(
             click.secho(
                 tabulate(errors, headers="keys", tablefmt="fancy_grid"), fg="red"
             )
-
-
-@odoo_module.command()
-@click.argument("name", required=True)
-@pass_config
-@click.pass_context
-def set_ribbon(ctx, config, name):
-    SQL = """
-        Select state from ir_module_module where name = 'web_environment_ribbon';
-    """
-    res = _execute_sql(config.get_odoo_conn(), SQL, fetchone=True)
-    if not (res and res[0] == "installed"):
-        try:
-            Commands.invoke(
-                ctx, "update", module=["web_environment_ribbon"], no_dangling_check=True
-            )
-        except Exception as ex:
-            print(ex)
-
-    _execute_sql(
-        config.get_odoo_conn(),
-        """
-        UPDATE
-            ir_config_parameter
-        SET
-            value = %s
-        WHERE
-            key = 'ribbon.name';
-    """,
-        params=(name,),
-    )
+    if errors:
+        sys.exit(-1)
 
 
 @odoo_module.command(help="For directly installed odoos.")
@@ -1192,25 +1310,6 @@ def _get_changed_files(git_sha):
     return filepaths2
 
 
-def _get_changed_modules(git_sha):
-    from .module_tools import Module
-
-    filepaths = _get_changed_files(git_sha)
-    modules = []
-    root = Path(os.getcwd())
-    for filepath in filepaths:
-
-        filepath = root / filepath
-
-        try:
-            module = Module(filepath)
-        except Module.IsNot:
-            pass
-        else:
-            modules.append(module.name)
-    return list(sorted(set(modules)))
-
-
 @odoo_module.command(name="list-changed-modules")
 @click.option("-s", "--start")
 @click.pass_context
@@ -1235,124 +1334,139 @@ def list_changed_files(ctx, config, start):
         click.secho(file)
 
 
-@odoo_module.command()
-@click.pass_context
-@click.option("--on-need", is_flag=True)
-@pass_config
-def make_dir_hashes(ctx, config, on_need):
-    from tqdm import tqdm
+def _get_global_hash_paths(relative_to_customs_dir=False):
     from .odoo_config import customs_dir
-    from .consts import FILE_DIRHASHES
 
-    customs_dir = customs_dir()
-    file_dirhashes = Path(customs_dir) / FILE_DIRHASHES
-    if on_need and file_dirhashes.exists():
-        return
-    hashes = subprocess.check_output(
-        ["sha1deep", "-r", "-l", "-j", "5", customs_dir], encoding="utf8"
-    ).strip()
+    customs_dir_path = customs_dir()
+    odoo_path = customs_dir_path / "odoo"
+    global_hash_paths = [
+        odoo_path / "odoo",
+        odoo_path / "requirements.txt",
+        odoo_path / "odoo-bin",
+    ]
+    if not relative_to_customs_dir:
+        return global_hash_paths
+    return [p.relative_to(customs_dir_path) for p in global_hash_paths]
 
-    file_hashes = {}
-    customs_dir = str(customs_dir)
-    for hash in hashes.splitlines():
-        hash, file = hash.split(" ", 1)
-        file = file.strip()
-        if file.startswith("./"):
-            file = file[2:]
-        elif file.startswith(customs_dir):
-            file = file[len(customs_dir) + 1 :]
 
-        file_hashes[file] = hash
+def _clean_customs(ctx, config):
+    from .odoo_config import customs_dir
 
-    paths = []
-    path_hashes = {}
-    for path in Path(customs_dir).glob("**/*"):
-        if path.is_dir():
-            if not (path / "__manifest__.py").exists() and path.name != "odoo":
-                continue
-            paths.append(path)
-    for path in tqdm(paths):
-        relpath = str(path.relative_to(customs_dir))
-        files = list(
-            sorted(filter(lambda x: str(x).startswith(relpath), file_hashes.keys()))
+    path = customs_dir()
+    if not config.force:
+        abort(
+            "Needs force option, because I call git clean -xdff and "
+            "all your work is lost. (Stashing before)"
         )
-        hashstring = "".join(file_hashes[file] for file in files)
-        path_hashes[relpath] = get_hash(hashstring)
-    file_dirhashes.write_text(json.dumps(path_hashes, indent=4))
+    if not is_git_clean(path):
+        subprocess.check_call(["git", "stash", "--include-untracked"], cwd=path)
+    subprocess.check_call(["git", "clean", "-xdff"], cwd=path)
+
+
+hash_cache = {}
+
+
+def _get_directory_hash(path):
+    if path not in hash_cache:
+        hash_cache[path] = get_directory_hash(path)
+    return hash_cache[path]
 
 
 @odoo_module.command()
-@click.argument("module")
-@click.pass_context
+@click.argument("module", required=True)
+@click.option("-N", "--no-cache", is_flag=True)
 @pass_config
-def list_deps(config, ctx, module):
+@click.pass_context
+def list_deps(ctx, config, module, no_cache):
     import arrow
 
     started = arrow.get()
     from .module_tools import Modules, DBModules, Module
+    from .module_tools import NotInAddonsPath
     from .odoo_config import customs_dir
-
-    modules = Modules()
-    module = Module.get_by_name(module)
-    ctx.invoke(make_dir_hashes, on_need=True)
-
-    data = {"modules": []}
-    data["modules"] = sorted(
-        map(lambda x: x.name, modules.get_module_flat_dependency_tree(module))
-    )
-    data["modules"].append(module.name)
-
-    data["auto_install"] = sorted(
-        map(
-            lambda x: x.name,
-            modules.get_filtered_auto_install_modules_based_on_module_list(
-                data["modules"]
-            ),
-        )
-    )
-    part1 = arrow.get() - started
-    started = arrow.get()
-    if config.verbose:
-        print(f"part1: {part1.total_seconds()}")
-
-    # get some hashes:
-    paths = []
-    for path in ["odoo"]:
-        path = customs_dir() / path
-        paths.append(path)
-    for mod in data["modules"]:
-        paths.append(Module.get_by_name(mod).path)
-    for mod in data["auto_install"]:
-        paths.append(Module.get_by_name(mod).path)
-
-    hashes = {}
-
-    @measure_time
-    def _get_hash(path):
-        hashes[path] = get_directory_hash(path)
-
     from .consts import FILE_DIRHASHES
 
-    dir_hashes = json.loads((customs_dir() / FILE_DIRHASHES).read_text())
+    _clean_customs(ctx, config)
 
-    # hash python version
-    python_version = config.ODOO_PYTHON_VERSION
-    to_hash = str(python_version)
-    for path in list(sorted(set(paths))):
-        relpath = path.relative_to(customs_dir())
-        _hash = dir_hashes.get(str(relpath))
-        if _hash is None:
-            _hash = get_directory_hash(path)
-        to_hash += _hash
+    click.secho("Loading Modules...", fg="yellow")
+    modules = Modules()
+    if module == "all":
+        do_all = True
+        module = [Module.get_by_name(x) for x in modules.modules]
+    else:
+        do_all = False
+        module = [Module.get_by_name(module)]
 
-    hash = get_hash(to_hash)
-    data["hash"] = hash
-    part2 = arrow.get() - started
-    if config.verbose:
-        print(f"part2: {part2.total_seconds()}")
+    result = {}
+    for module in module:
+
+        data = {"modules": []}
+        data["modules"] = sorted(
+            list(map(lambda x: x.name, modules.get_module_flat_dependency_tree(module)))
+            + [module.name]
+        )
+
+        data["auto_install"] = sorted(
+            map(
+                lambda x: x.name,
+                modules.get_filtered_auto_install_modules_based_on_module_list(
+                    data["modules"]
+                ),
+            )
+        )
+        part1 = arrow.get() - started
+        started = arrow.get()
+        if config.verbose:
+            print(f"part1: {part1.total_seconds()}")
+
+        # get some hashes:
+        paths = _get_global_hash_paths(True)
+        for mod in data["modules"]:
+            try:
+                objmod = Module.get_by_name(mod)
+                paths.append(objmod.path)
+            except NotInAddonsPath:
+                pass
+        for mod in data["auto_install"]:
+            paths.append(Module.get_by_name(mod).path)
+
+        # hash python version
+        python_version = config.ODOO_PYTHON_VERSION
+        to_hash = str(python_version) + ";"
+        for path in list(sorted(set(paths))):
+            _hash = _get_directory_hash(path)
+            if _hash is None:
+                raise Exception(
+                    f"No hash found for {path} try it again with --no-cache"
+                )
+            to_hash += f"{path} {_hash},"
+
+        if config.verbose:
+            # break the hash in chunks and output the hash
+            todo = to_hash
+            i = 0
+            while todo:
+                i += 1
+                SIZE = 100
+                part = todo[:SIZE]
+                todo = todo[SIZE:]
+                click.secho(f"{i}.\n{part}", fg="blue")
+                click.secho(get_hash(part), fg="yellow")
+
+            click.secho(f"\n\nTo Hash:\n{to_hash}\n\n")
+        hash = get_hash(to_hash)
+        data["hash"] = hash
+        part2 = arrow.get() - started
+        if config.verbose:
+            print(f"part2: {part2.total_seconds()}")
+
+        if not do_all:
+            result = data
+        else:
+            result[module.name] = data
 
     click.secho("---")
-    click.secho(json.dumps(data, indent=4))
+    click.secho(json.dumps(result, indent=4))
 
 
 @odoo_module.command()
@@ -1371,7 +1485,55 @@ def migrate():
     )
 
 
-Commands.register(progress)
+@odoo_module.command()
+@pass_config
+@click.pass_context
+def list_modules(ctx, config):
+    from .module_tools import Modules, DBModules
+
+    mods = Modules()
+    modules = list(sorted(mods.get_all_modules_installed_by_manifest()))
+    print("---")
+    for m in modules:
+        print(m)
+
+
+def _get_modules_since_git_sha(sha):
+    from .odoo_config import MANIFEST
+
+    module = list(_get_changed_modules(sha))
+
+    # filter modules to defined ones in MANIFEST
+    click.secho(f"Following modules change since last sha: {' '.join(module)}")
+
+    module = list(filter(lambda x: x in MANIFEST()["install"], module))
+    click.secho(
+        (
+            "Following modules changed since last sha "
+            f"(filtered to manifest): {' '.join(module)}"
+        )
+    )
+    return module
+
+
+def _get_changed_modules(git_sha):
+    from .module_tools import Module
+
+    filepaths = _get_changed_files(git_sha)
+    modules = []
+    root = Path(os.getcwd())
+    for filepath in filepaths:
+
+        filepath = root / filepath
+
+        try:
+            module = Module(filepath)
+        except Module.IsNot:
+            pass
+        else:
+            modules.append(module.name)
+    return list(sorted(set(modules)))
+
+
 Commands.register(update)
 Commands.register(show_install_state)
-Commands.register(make_dir_hashes)

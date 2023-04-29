@@ -18,10 +18,9 @@ from .tools import exec_file_in_path
 from .tools import remove_webassets
 from .tools import _askcontinue
 from .tools import get_volume_names
-from . import cli, pass_config, dirs, files, Commands
+from .cli import cli, pass_config, Commands
 from .lib_clickhelpers import AliasedGroup
 from .tools import __hash_odoo_password
-from . import project_name
 from .tools import _remove_postgres_connections, _execute_sql
 
 def __get_snapshots(config):
@@ -55,20 +54,11 @@ def restore(config, snap):
     ])
 
 @measure_time
-def make_snapshot(config, name):
-    snapshot_name = "{}_{}_snapshot_{}".format(
-        config.dbname,
-        name,
-        datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-    )
-    conn = config.get_odoo_conn()
-    _remove_postgres_connections(conn)
-    subprocess.call([
-        exec_file_in_path('createdb'),
-        '-T',
-        config.dbname,
-        snapshot_name,
-    ])
+@click.pass_context
+def make_snapshot(ctx, config, name):
+    now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    snapshot_name = f"{config.dbname}_{name}_snapshot_{now}"
+    Commands.invoke(ctx, "backup", snapshot_name)
     return snapshot_name
 
 def remove(config, snapshot):

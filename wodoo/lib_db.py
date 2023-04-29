@@ -12,9 +12,10 @@ from .tools import _wait_postgres
 from .tools import _dropdb
 from .tools import __dcrun, _remove_postgres_connections, _execute_sql
 from .tools import exec_file_in_path
-from . import cli, pass_config, Commands
+from .cli import cli, pass_config, Commands
 from .lib_clickhelpers import AliasedGroup
 from .tools import __hash_odoo_password
+from .tools import _make_sure_module_is_installed
 
 
 @cli.group(cls=AliasedGroup)
@@ -23,189 +24,215 @@ def db(config):
     """
     Database related actions.
     """
-    click.echo((
-        f"database-name: {config.dbname}, "
-        f"in ram: {config.run_postgres_in_ram}"
-    ))
+    click.echo(
+        (f"database-name: {config.dbname}, " f"in ram: {config.run_postgres_in_ram}")
+    )
+
 
 @db.command()
 @pass_config
 def db_health_check(config):
     conn = config.get_odoo_conn()
-    click.secho((
-        f"Connecting to {conn.host}:{conn.port}/{config.dbname}"
-    ))
+    click.secho((f"Connecting to {conn.host}:{conn.port}/{config.dbname}"))
     try:
-        _execute_sql(conn,
-        "select * from pg_catalog.pg_tables;", fetchall=True)
+        _execute_sql(conn, "select * from pg_catalog.pg_tables;", fetchall=True)
     except Exception:  # pylint: disable=broad-except
         abort("Listing tables failed for connection to {conn.host}")
     else:
-        click.secho((
-            'Success'
-        ), fg='green')
+        click.secho(("Success"), fg="green")
+
 
 @db.command()
-@click.argument('dbname', required=True)
+@click.argument("dbname", required=True)
 @pass_config
 def drop_db(config, dbname):
     if not (config.devmode or config.force):
-        click.secho("Either DEVMODE or force required", fg='red')
+        click.secho("Either DEVMODE or force required", fg="red")
         sys.exit(-1)
-    conn = config.get_odoo_conn().clone(dbname='postgres')
-    _remove_postgres_connections(
-        conn, sql_afterwards=f"drop database {dbname};")
-    click.echo("Database {} dropped.".format(dbname))
+    conn = config.get_odoo_conn().clone(dbname="postgres")
+    _remove_postgres_connections(conn, sql_afterwards=f"drop database {dbname};")
+    click.echo(f"Database {dbname} dropped.")
+
 
 @db.command()
 @pass_config
 def pgactivity(config):
     from .tools import DBConnection
+
     conn = DBConnection(
-        config.dbname,
-        config.db_host,
-        config.db_port,
-        config.db_user,
-        config.db_pwd
+        config.dbname, config.db_host, config.db_port, config.db_user, config.db_pwd
     )
-    __dcrun([
-        "pgtools", 'pg_activity',
-        '-p', str(conn.port),
-        '-U', conn.user,
-        '-d', conn.dbname,
-        '-h', conn.host,
-        ], env={
+    __dcrun(
+        config,
+        [
+            "pgtools",
+            "pg_activity",
+            "-p",
+            str(conn.port),
+            "-U",
+            conn.user,
+            "-d",
+            conn.dbname,
+            "-h",
+            conn.host,
+        ],
+        env={
             "PGPASSWORD": conn.pwd,
-        }, interactive=True)
+        },
+        interactive=True,
+    )
+
 
 @db.command()
-@click.argument('dbname', required=False)
-@click.argument('params', nargs=-1)
-@click.option('-h', '--host', required=False)
-@click.option('-p', '--port', required=False)
-@click.option('-u', '--user', required=False)
-@click.option('-P', '--password', required=False)
+@click.argument("dbname", required=False)
+@click.argument("params", nargs=-1)
+@click.option("-h", "--host", required=False)
+@click.option("-p", "--port", required=False)
+@click.option("-u", "--user", required=False)
+@click.option("-P", "--password", required=False)
 @pass_config
 def pgcli(config, dbname, params, host, port, user, password):
     from .tools import DBConnection
 
     dbname = dbname or config.dbname
-    os.environ['ODOO_FRAMEWORK_KEEP_SQL_CONNECTION'] = '1'  # will be executed there so connection string will point to postgres
 
     if host:
         if any(not x for x in [port, user, password]):
-            click.secho("If you provide a host, then provide please all connection informations.")
+            click.secho(
+                "If you provide a host, then provide please all connection informations."
+            )
         conn = DBConnection(dbname, host, int(port), user, password)
     else:
-        conn = config.get_odoo_conn().clone(dbname=dbname)
+        conn = config.get_odoo_conn(inside_container=True).clone(dbname=dbname)
     return _pgcli(config, conn, params, use_docker_container=True)
 
+
 @db.command()
-@click.argument('dbname', required=False)
-@click.argument('params', nargs=-1)
+@click.argument("dbname", required=False)
+@click.argument("params", nargs=-1)
 @click.option("--sql", required=False)
 @click.option("-ni", "--non-interactive", is_flag=True)
 @pass_config
 def psql(config, dbname, params, sql, non_interactive):
     dbname = dbname or config.dbname
-    os.environ['ODOO_FRAMEWORK_KEEP_SQL_CONNECTION'] = '1'  # will be executed there so connection string will point to postgres
-    conn = config.get_odoo_conn().clone(dbname=dbname)
+    conn = config.get_odoo_conn(inside_container=True).clone(dbname=dbname)
     return _psql(config, conn, params, sql=sql, interactive=not non_interactive)
 
-def _psql(config, conn, params, bin='psql', sql=None, use_docker_container=None, interactive=True):
+
+def _psql(
+    config,
+    conn,
+    params,
+    bin="psql",
+    sql=None,
+    use_docker_container=None,
+    interactive=True,
+):
     dbname = conn.dbname
     if not dbname and len(params) == 1:
-        if params[0] in ['postgres', dbname]:
+        if params[0] in ["postgres", dbname]:
             dbname = params[0]
             params = []
     params = " ".join(params)
-    psql_args = ['-h', conn.host, '-p', str(conn.port), '-U', conn.user]
-    if bin == 'psql':
-        psql_args += ['-v', 'ON_ERROR_STOP=1']
+    psql_args = ["-h", str(conn.host), "-U", conn.user]
+    if conn.port:
+        psql_args += ["-p", str(conn.port)]
+    if bin == "psql":
+        psql_args += ["-v", "ON_ERROR_STOP=1"]
     if sql:
-        psql_args += ['-c', sql]
+        psql_args += ["-c", sql]
     if not interactive:
-        psql_args += ['-q']
+        psql_args += ["-q"]
     try:
         cmd = psql_args
         cmd += [
             dbname,
         ]
+
         if use_docker_container or (config.use_docker and config.run_postgres):
-            __dcrun(['pgtools', bin] + cmd, interactive=interactive, env={
-                "PGPASSWORD": conn.pwd,
-            })
+            __dcrun(
+                config,
+                ["pgtools", bin] + cmd,
+                interactive=interactive,
+                env={
+                    "PGPASSWORD": conn.pwd,
+                },
+            )
         else:
-            subprocess.call([
-                exec_file_in_path(bin),
-            ] + cmd, env={"PGPASSWORD": conn.pwd})
+            subprocess.call(
+                [
+                    exec_file_in_path(bin),
+                ]
+                + cmd,
+                env={"PGPASSWORD": conn.pwd},
+            )
     finally:
-        os.environ['PGPASSWORD'] = ""
+        os.environ["PGPASSWORD"] = ""
+
 
 def _pgcli(config, conn, params, use_docker_container=None):
-    _psql(config, conn, params, bin='pgcli', use_docker_container=use_docker_container)
+    _psql(config, conn, params, bin="pgcli", use_docker_container=use_docker_container)
 
-@db.command(name='reset-odoo-db')
-@click.argument('dbname', required=False)
-@click.option('--do-not-install-base', is_flag=True)
+
+@db.command(name="reset-odoo-db")
+@click.argument("dbname", required=False)
+@click.option("--do-not-install-base", is_flag=True)
+@click.option("-C", "--collateC", is_flag=True, help="Use Collate C like odoo suggests")
 @pass_config
 @click.pass_context
-def reset_db(ctx, config, dbname, do_not_install_base):
+def reset_db(ctx, config, dbname, do_not_install_base, collatec):
     dbname = dbname or config.dbname
     if not dbname:
         raise Exception("dbname required")
     if config.run_postgres:
-        Commands.invoke(ctx, 'up', machines=['postgres'], daemon=True)
+        Commands.invoke(ctx, "up", machines=["postgres"], daemon=True)
     _wait_postgres(config)
     conn = config.get_odoo_conn().clone(dbname=dbname)
     _dropdb(config, conn)
-    conn = config.get_odoo_conn().clone(dbname='postgres')
-    _execute_sql(
-        conn,
-        f"create database {dbname}",
-        notransaction=True
-    )
+    conn = config.get_odoo_conn().clone(dbname="postgres")
+    cmd2 = ""
+    if collatec:
+        cmd2 = "LC_CTYPE 'C' LC_COLLATE 'C' ENCODING 'utf8' TEMPLATE template0"
+    cmd = f"create database {dbname} {cmd2} "
+    _execute_sql(conn, cmd, notransaction=True)
 
     # since odoo version 12 "-i base -d <name>" is required
     if not do_not_install_base:
         Commands.invoke(
             ctx,
-            'update',
-            module=['base'],
+            "update",
+            module=["base"],
             since_git_sha=False,
             no_extra_addons_paths=True,
             no_restart=True,
             no_dangling_check=True,
             no_update_module_list=True,
             non_interactive=True,
+            no_outdated_modules=True,
         )
+
 
 @db.command()
 @pass_config
 @click.pass_context
 def anonymize(ctx, config):
     if not (config.devmode or config.force):
-        click.secho("Either DEVMODE or force required", fg='red')
+        click.secho("Either DEVMODE or force required", fg="red")
         sys.exit(-1)
 
-    # Commands.invoke(
-    #     ctx,
-    #     'update',
-    #     module=['anonymize'],
-    #     no_restart=False,
-    #     no_dangling_check=True,
-    #     no_update_module_list=False,
-    #     non_interactive=True,
-    # )
+    _make_sure_module_is_installed(
+        ctx, config, "anonymize", "https://github.com/marcwimmer/odoo-anonymize.git"
+    )
 
     Commands.invoke(
         ctx,
-        'odoo-shell',
+        "odoo-shell",
         command=[
             'env["frameworktools.anonymizer"]._run()',
-            'env.cr.commit()',
+            "env.cr.commit()",
         ],
     )
+
 
 @db.command()
 @click.option("--no-update", is_flag=True)
@@ -213,25 +240,30 @@ def anonymize(ctx, config):
 @click.pass_context
 def cleardb(ctx, config, no_update):
     if not (config.devmode or config.force):
-        click.secho("Either DEVMODE or force required", fg='red')
+        click.secho("Either DEVMODE or force required", fg="red")
         sys.exit(-1)
+
+    _make_sure_module_is_installed(
+        ctx, config, "cleardb", "https://github.com/marcwimmer/odoo-cleardb.git"
+    )
 
     if not no_update:
         Commands.invoke(
             ctx,
-            'update',
-            module=['cleardb'],
+            "update",
+            module=["cleardb"],
             no_restart=False,
             no_dangling_check=True,
             no_update_module_list=False,
             non_interactive=True,
+            recover_view_error=True,
         )
 
         # update of all modules then required, so that metainformation is
         # written to ir.model (the _cleardb flag on model)
         Commands.invoke(
             ctx,
-            'update',
+            "update",
             module=[],
             no_restart=False,
             no_dangling_check=True,
@@ -241,102 +273,20 @@ def cleardb(ctx, config, no_update):
 
     Commands.invoke(
         ctx,
-        'odoo-shell',
+        "odoo-shell",
         command=[
             'env["frameworktools.cleardb"]._run()',
-            'env.cr.commit()',
+            "env.cr.commit()",
         ],
     )
 
-@db.command(name='setname')
+
+@db.command(name="setname")
 @click.argument("DBNAME", required=True)
 @click.pass_context
 def set_db_name(ctx, DBNAME):
-    Commands.invoke(ctx, 'set_setting', key="DBNAME", value=DBNAME)
+    Commands.invoke(ctx, "set_setting", key="DBNAME", value=DBNAME)
 
-def __collect_other_turndb2dev_sql():
-    from .odoo_config import customs_dir
-    dir = customs_dir() / 'devscripts'
-    if not dir.exists():
-        return ""
-    sqls = []
-    for file in dir.glob("**/*.sql"):
-        sqls.append(file.read_text())
-    return "\n\n".join(sqls)
-
-def __turn_into_devdb(config, conn):
-    from .odoo_config import current_version
-    from .myconfigparser import MyConfigParser
-    myconfig = MyConfigParser(config.files['settings'])
-    env = dict(map(lambda k: (k, myconfig.get(k)), myconfig.keys()))
-
-    # encrypt password
-    env['DEFAULT_DEV_PASSWORD'] = __hash_odoo_password(env['DEFAULT_DEV_PASSWORD'])
-
-    sql_file = config.dirs['images'] / 'odoo' / 'config' / str(current_version()) / 'turndb2dev.sql'
-    sql = sql_file.read_text()
-
-    sql += __collect_other_turndb2dev_sql() or ""
-
-    sql = __replace_all_envs_in_str(sql, env)
-
-    critical = False
-    for line in sql.split("\n"):
-        if not line:
-            continue
-        if line.startswith("--set critical"):
-            critical = True
-            continue
-        elif line.startswith("--set not-critical"):
-            critical = False
-            continue
-
-        comment = re.findall(r'\/\*[^\*^\/]*\*\/', line)
-        if comment:
-
-            def ignore_line(comment):
-                comment = comment[2:-2]
-                if 'if-table-exists' in comment:
-                    table = comment.split("if-table-exists")[1].strip()
-                    res = _execute_sql(
-                        conn,
-                        (
-                            "select count(*) "
-                            "from information_schema.tables "
-                            "where table_schema='public' and "
-                            f"table_name='{table}'"
-                        ),
-                        fetchone=True
-                    )
-                    return not res[0]
-                elif 'if-column-exists' in comment:
-                    table, column = comment.split("if-column-exists")[1].strip().split(".")
-                    res = _execute_sql(
-                        conn,
-                        (
-                            "select count(*) "
-                            "from information_schema.columns "
-                            "where table_schema='public' and "
-                            f"table_name='{table.strip()}' and "
-                            "column_name='{column.strip()}' "
-                        ),
-                        fetchone=True
-                    )
-                    return not res[0]
-                return False
-
-            if any(list(
-                    ignore_line(comment) for comment in comment[0].split(
-                        ";"))):
-                continue
-        try:
-            print(line)
-            _execute_sql(conn, line)
-        except Exception:
-            if critical:
-                raise
-            msg = traceback.format_exc()
-            print("failed un-critical sql:", msg)
 
 @db.command()
 @pass_config
@@ -352,7 +302,8 @@ def db_size(ctx, config):
     click.secho("---")
     click.secho(size)
 
-@db.command(name='show-table-sizes')
+
+@db.command(name="show-table-sizes")
 @pass_config
 @click.pass_context
 def show_table_sizes(ctx, config, top=20):
@@ -401,27 +352,30 @@ SELECT table_schema
 ORDER BY total_bytes DESC;
     """
     conn = config.get_odoo_conn()
-    rows = _execute_sql(
-        conn,
-        sql,
-        fetchall=True
-    )
+    rows = _execute_sql(conn, sql, fetchall=True)
     from tabulate import tabulate
+
     if top:
         rows = rows[:top]
-    click.echo(tabulate(rows, [
-        "TABLE_NAME", "row_estimate", "total", 'INDEX', 'toast', 'TABLE']))
+    click.echo(
+        tabulate(
+            rows, ["TABLE_NAME", "row_estimate", "total", "INDEX", "toast", "TABLE"]
+        )
+    )
+
 
 @db.command(help="Export as excel")
 @click.argument("sql", required=True)
-@click.option('-f', '--file')
-@click.option('-b', '--base64', is_flag=True)
+@click.option("-f", "--file")
+@click.option("-b", "--base64", is_flag=True)
 @pass_config
 def excel(config, sql, file, base64):
     import base64 as Base64
+
     if base64:
         sql = Base64.b64decode(sql)
     import xlsxwriter
+
     conn = config.get_odoo_conn()
     columns, rows = _execute_sql(conn, sql, fetchall=True, return_columns=True)
     click.secho(f"exporting {len(rows)} rows...")
@@ -429,8 +383,7 @@ def excel(config, sql, file, base64):
         filepath = Path(os.getcwd()) / file
     else:
         filepath = Path(os.getcwd()) / (
-            f"{conn.dbname}_"
-            f"{arrow.get().strftime('%Y-%m-%d%H-%M-%S')}.xlsx"
+            f"{conn.dbname}_" f"{arrow.get().strftime('%Y-%m-%d%H-%M-%S')}.xlsx"
         )
 
     # Workbook() takes one, non-optional, argument
@@ -457,62 +410,107 @@ def excel(config, sql, file, base64):
         cmd = f'chown {config.owner_uid}:{config.owner_uid} "{filepath}"'
         os.system(cmd)
 
+
 @db.command()
-@click.option('--no-scram', is_flag=True)
+@click.option("--no-scram", is_flag=True)
 @pass_config
 def pghba_conf_wide_open(config, no_scram):
-    conn = config.get_odoo_conn().clone(dbname='postgres')
-    setting = _execute_sql(
-        conn,
-        "select setting from pg_settings where name like '%hba%';",
-        fetchone=True)
+    conn = config.get_odoo_conn().clone(dbname="postgres")
 
-    if not setting:
-        click.secho("No pghba.conf location found.")
-        return
-    pghba_conf = setting[0]
+    def adapt_pghba_conf():
+        setting = _execute_sql(
+            conn,
+            "select setting from pg_settings where name like '%hba%';",
+            fetchone=True,
+        )
 
-    _execute_sql(
-        conn, "drop table if exists hba;"
-    )
-    _execute_sql(
-        conn, "create table hba ( lines text );"
-    )
+        if not setting:
+            click.secho("No pghba.conf location found.")
+            return
+        pghba_conf = setting[0]
 
-    _execute_sql(conn, f"copy hba from '{pghba_conf}';")
-    _execute_sql(
-        conn, (
-            "delete from hba "
-            "where lines like 'host%all%all%all%md5'"
-    ))
-    _execute_sql(
-        conn, (
-            "insert into hba (lines) "
-            "values ('"
-            f"host all all all md5"
-            "');"
-    ))
-    if no_scram:
+        _execute_sql(conn, "drop table if exists hba;")
+        _execute_sql(conn, "create table hba ( lines text );")
+
+        _execute_sql(conn, f"copy hba from '{pghba_conf}';")
         _execute_sql(
-            conn, (
-                "update hba "
-                " set lines = replace(lines, 'scram-sha-256', 'md5')"
-        ))
-    _execute_sql(conn, f"copy hba to '{pghba_conf}';")
-    _execute_sql(conn, "select pg_reload_conf();")
-    _execute_sql(conn, "drop table hba")
-    _execute_sql(
-        conn, "create table hba ( lines text );"
-    )
-    _execute_sql(conn, f"copy hba from '{pghba_conf}';")
+            conn, ("delete from hba " "where lines like 'host%all%all%all%md5'")
+        )
+        for method in ["trust", "scram", "md5"]:
+            _execute_sql(
+                conn,
+                ("delete from hba " f"where lines like 'host%all%all%all%{method}'"),
+            )
 
-    rows = _execute_sql(conn, (
-        "select * from hba;"
-    ), fetchall=True)
-    for x in rows:
-        if x[0].startswith("#"):
-            continue
-        print(x[0])
+        def trustline():
+            if config.devmode:
+                trustline = "host all all all trust"
+            else:
+                if no_scram:
+                    trustline = "host all all all md5"
+                else:
+                    trustline = "host all all all scram-sha-256"
+            _execute_sql(conn, (f"insert into hba(lines) values('{trustline}');"))
+
+        trustline()
+
+        _execute_sql(conn, f"copy hba to '{pghba_conf}';")
+        _execute_sql(conn, "select pg_reload_conf();")
+        _execute_sql(conn, "drop table hba")
+        _execute_sql(conn, "create table hba ( lines text );")
+        _execute_sql(conn, f"copy hba from '{pghba_conf}';")
+
+        rows = _execute_sql(conn, ("select * from hba;"), fetchall=True)
+        for x in rows:
+            if x[0].startswith("#"):
+                continue
+            print(x[0])
+
+    def adapt_postgres_conf():
+        setting = _execute_sql(
+            conn,
+            "select setting from pg_settings where name = 'config_file';",
+            fetchone=True,
+        )
+
+        if not setting:
+            click.secho("No postgresql.conf location found.")
+            return
+        conf = setting[0]
+
+        _execute_sql(conn, "drop table if exists hba;")
+        _execute_sql(conn, "create table hba ( lines text );")
+
+        _execute_sql(conn, f"copy hba from '{conf}' with (delimiter E'~');")
+        _execute_sql(
+            conn, ("delete from hba " "where lines like '%password_encryption%'")
+        )
+        _execute_sql(conn, ("update hba set lines = replace(lines, '\t', ' ')"))
+        if no_scram:
+            _execute_sql(
+                conn,
+                (
+                    "insert into hba (lines) "
+                    "values ('"
+                    f"password_encryption=md5"
+                    "');"
+                ),
+            )
+        _execute_sql(conn, f"copy hba to '{conf}';")
+        _execute_sql(conn, "select pg_reload_conf();")
+        _execute_sql(conn, "drop table hba")
+        _execute_sql(conn, "create table hba ( lines text );")
+        _execute_sql(conn, f"copy hba from '{conf}';")
+
+        rows = _execute_sql(conn, ("select * from hba;"), fetchall=True)
+        for x in rows:
+            if x[0].startswith("#"):
+                continue
+            print(x[0])
+
+    adapt_pghba_conf()
+    adapt_postgres_conf()
 
 
-Commands.register(reset_db, 'reset-db')
+Commands.register(reset_db, "reset-db")
+Commands.register(pghba_conf_wide_open, "pghba_conf_wide_open")
