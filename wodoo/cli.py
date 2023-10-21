@@ -1,49 +1,59 @@
-import sys
-import subprocess
-from datetime import datetime
-from pathlib import Path
-import inspect
 import os
-
-# from .myconfigparser import MyConfigParser  # NOQA load this module here, otherwise following lines and sublines get error
+import click
+from pathlib import Path
 try:
-    import click
     from .lib_clickhelpers import AliasedGroup
 except ImportError:
     click = None
-from .tools import _file2env
+from .click_config import Config
+from .click_global_commands import GlobalCommands
 
-from . import module_tools  # NOQA
-from . import odoo_config  # NOQA
+Commands = GlobalCommands()
+pass_config = click.make_pass_decorator(Config, ensure=True)
 
-SCRIPT_DIRECTORY = Path(inspect.getfile(inspect.currentframe())).absolute().parent
+@click.group(cls=AliasedGroup)
+@click.option("-f", "--force", is_flag=True)
+@click.option("-v", "--verbose", is_flag=True)
+@click.option("--version", is_flag=True)
+@click.option(
+    "-xs",
+    "--restrict-setting",
+    multiple=True,
+    help="Several parameters; limit to special configuration files settings and docker-compose files. All other configuration files will be ignored.",
+)
+@click.option(
+    "-xd",
+    "--restrict-docker-compose",
+    multiple=True,
+    help="Several parameters; limit to special configuration files settings and docker-compose files. All other configuration files will be ignored.",
+)
+@click.option("-p", "--project-name", help="Set Project-Name")
+@click.option("--chdir", help="Set Working Directory")
+@pass_config
+def cli(
+    config,
+    force,
+    verbose,
+    project_name,
+    restrict_setting,
+    restrict_docker_compose,
+    chdir,
+    version,
+):
+    config.force = force
+    config.verbose = verbose
+    if chdir:
+        os.chdir(chdir)
+        config.WORKING_DIR = chdir
 
+    from .tools import _get_default_project_name
 
-os.environ["HOST_HOME"] = os.getenv("HOME", "")
-os.environ["ODOO_HOME"] = str(SCRIPT_DIRECTORY)
+    if not project_name:
+        project_name = _get_default_project_name(restrict_setting)
 
-
-from .cli import cli
-from . import lib_clickhelpers  # NOQA
-from . import lib_composer  # NOQA
-from . import lib_backup  # NOQA
-from . import lib_control  # NOQA
-from . import lib_db  # NOQA
-from . import lib_db_snapshots  # NOQA
-from . import lib_lang  # NOQA
-from . import lib_module  # NOQA
-from . import lib_setup  # NOQA
-from . import lib_src  # NOQA
-from . import lib_docker_registry  # NOQA
-from . import lib_turnintodev  # NOQA
-from . import lib_talk  # NOQA
-from . import daddy_cleanup  # NOQA
-
-# import container specific commands
-from .tools import abort  # NOQA
-from .tools import __dcrun  # NOQA
-from .tools import __dc  # NOQA
-
+    config.set_restrict('settings', restrict_setting)
+    config.set_restrict('docker-compose', restrict_docker_compose)
+    config.project_name = project_name
 
 @cli.command()
 @click.option(
