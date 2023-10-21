@@ -9,7 +9,6 @@ import json
 import base64
 import subprocess
 import inquirer
-from git import Repo
 import traceback
 from datetime import datetime
 import shutil
@@ -19,6 +18,7 @@ import click
 
 from wodoo.robo_helpers import _get_required_odoo_modules_from_robot_file
 from .tools import is_git_clean
+from gimera.repo import Repo
 from .tools import get_hash
 from .tools import get_directory_hash
 from .tools import sync_folder
@@ -26,15 +26,20 @@ from .tools import __dcrun
 from .tools import __cmd_interactive
 from .tools import __get_installed_modules
 from .tools import __concurrent_safe_write_file
-from . import cli, pass_config, Commands
+from .cli import cli, pass_config, Commands
 from .lib_clickhelpers import AliasedGroup
 from .tools import _execute_sql
 from .tools import get_services
 from .tools import __try_to_set_owner
 from .tools import measure_time, abort
+from .tools import _update_setting
+from .tools import _get_setting
+from .tools import get_git_hash
+from .module_tools import _determine_affected_modules_for_ir_field_and_related
 from pathlib import Path
 
 DTF = "%Y-%m-%d %H:%M:%S"
+KEY_SHA_REVISION = "sha.revision"
 
 
 class UpdateException(Exception):
@@ -42,7 +47,9 @@ class UpdateException(Exception):
 
 
 class RepeatUpdate(Exception):
-    pass
+    def __init__(self, affected_modules):
+        super().__init__(str(affected_modules))
+        self.affected_modules = affected_modules
 
 
 @cli.group(cls=AliasedGroup)
@@ -78,7 +85,7 @@ def update_module_file(module):
     from .module_tools import Module
 
     for module in module:
-        Module.get_by_name(module).update_module_file()
+        Module.get_by_name(module, nocache=True).update_module_file()
 
 
 @odoo_module.command(name="run-tests")
@@ -133,7 +140,9 @@ def run_tests(ctx, config):
                 params = ["odoo", "/odoolib/unit_test.py", f"{file}"]
                 click.secho(f"Running test: {file}", fg="yellow", bold=True)
                 res = __dcrun(
-                    params + ["--log-level=error", "--not-interactive"], returncode=True
+                    config,
+                    params + ["--log-level=error", "--not-interactive"],
+                    returncode=True,
                 )
                 if res:
                     failed.append(file)
@@ -143,7 +152,7 @@ def run_tests(ctx, config):
                         bold=True,
                     )
                     res = __cmd_interactive(
-                        *(["run", "--rm"] + params + ["--log-level=debug"])
+                        config, *(["run", "--rm"] + params + ["--log-level=debug"])
                     )
                 else:
                     success.append(file)
@@ -210,6 +219,7 @@ def _get_outdated_versioned_modules_of_deptree(modules):
 
     """
     from .module_tools import Modules, DBModules, Module
+    from .module_tools import NotInAddonsPath
     from .odoo_config import MANIFEST
 
     mods = Modules()
@@ -221,9 +231,10 @@ def _get_outdated_versioned_modules_of_deptree(modules):
 
         try:
             mod = Module.get_by_name(module)
-        except KeyError:
+        except (KeyError, NotInAddonsPath):
             click.secho(
-                f"Warning module not found: {module}", fg='yellow',
+                f"Warning module not found: {module}",
+                fg="yellow",
             )
             continue
         for dep in mods.get_module_flat_dependency_tree(mod):
@@ -249,124 +260,71 @@ def _get_outdated_versioned_modules_of_deptree(modules):
             if len(new_version) == 2:
                 # add odoo version in front
                 odoo_version = str(MANIFEST()["version"]).split(".")
-                assert len(odoo_version) == 2, "Version in manifest should be like 16.0"
+                assert (
+                    len(odoo_version) == 2
+                ), f"Version in manifest should be like 16.0 not '{odoo_version}' as it is in {MANIFEST().path}"
                 new_version = tuple(list(map(int, odoo_version)) + list(new_version))
                 del odoo_version
 
             if new_version > version:
-                yield dep
+                # seen: if version in manifest is 14.0.1.0 and installed in
+                # 13.0 odoo then version becomes inside odoo: 13.0.14.0.10
+                # so try to match including current version:
+                odoo_version = list(map(int, str(MANIFEST()['version']).split(".")))
+                new_version = tuple(odoo_version + list(new_version))
+                if new_version != version:
+                    yield dep
 
 
-@odoo_module.command()
-@click.argument("migration-file", required=True)
-@click.argument("mode", required=True)
-@click.option("--allow-serie", is_flag=True)
-@click.option("--force-version")
-@pass_config
-@click.pass_context
-def marabunta(ctx, config, migration_file, mode, allow_serie, force_version):
-    click.secho(
-        """
-            _.._.-..-._
-        .-'  .'  /\\  \\`._
-        /    /  .'  `-.\\  `.
-            :_.'  ..    :       _.../\\
-            |           ;___ .-'   //\\\\.
-            \\  _..._  /    `/\\   //  \\\\\\
-            `-.___.-'  /\\ //\\\\       \\\\:
-                |    //\\V/ :\\\\       \\\\
-                    \\      \\\\/  \\\\      /\\\\
-                    `.____.\\\\   \\\\   .'  \\\\
-                    //   /\\\\---\\\\-'     \\\\
-                fsc  //   // \\\\   \\\\       \\\\
-    """,
-        fg="red",
-    )
+def _get_available_modules(ctx, param, incomplete):
+    from .odoo_config import MANIFEST
 
-    click.secho("=================================", fg="yellow")
-    click.secho("MARABUNTA", fg="yellow")
-    click.secho("=================================", fg="yellow")
-    params = [
-        "--migration-file",
-        "/opt/src/" + migration_file,
-        "--database",
-        config.dbname,
-        "--db-user",
-        config.db_user,
-        "--db-password",
-        config.db_pwd,
-        "--db-port",
-        config.db_port,
-        "--db-host",
-        config.db_host,
-        "--mode",
-        mode,
-    ]
-    if allow_serie:
-        params += ["--allow-serie"]
-    if force_version:
-        params += ["--force-version", force_version]
-
-    params = ["run", "odoo", "/usr/local/bin/marabunta"] + params
-    return __cmd_interactive(*params)
+    try:
+        manifest = MANIFEST()
+        if not manifest:
+            raise Exception("no manifest")
+    except:
+        return []
+    modules = manifest["install"]
+    if incomplete:
+        modules = [x for x in modules if incomplete in x]
+    return sorted(modules)
 
 
-@odoo_module.command(
-    help=("If menu items are missing, then recomputing the parent store" "can help")
-)
-@pass_config
-@click.pass_context
-def recompute_parent_store(ctx, config):
-    if config.use_docker:
-        from .lib_control_with_docker import shell as lib_shell
-
-    click.secho("Recomputing parent store...", fg="blue")
-    lib_shell(
-        (
-            "for model in self.env['ir.model'].search([]):\n"
-            "   try:\n"
-            "       obj = self.env[model.model]\n"
-            "   except KeyError: pass\n"
-            "   else:\n"
-            "       obj._parent_store_compute()\n"
-            "       env.cr.commit()\n"
-        )
-    )
-    click.secho("Recompute parent store done.", fg="green")
-
-
-@odoo_module.command(
-    help=(
-        "As the name says: if db was transferred, web-icons are restored"
-        " on missing assets"
-    )
-)
-@pass_config
-@click.pass_context
-def restore_web_icons(ctx, config):
-    if config.use_docker:
-        from .lib_control_with_docker import shell as lib_shell
-
-    click.secho("Restoring web icons...", fg="blue")
-    lib_shell(
-        (
-            "for x in self.env['ir.ui.menu'].search([]):\n"
-            "   if not x.web_icon: continue\n"
-            "   x.web_icon_data = x._compute_web_icon_data(x.web_icon)\n"
-            "   env.cr.commit()\n"
-        )
-    )
-    click.secho("Restored web icons.", fg="green")
-
-
-@odoo_module.command()
-@click.argument("module", nargs=-1, required=False)
+@odoo_module.command(name="UPDATE")
 @click.option(
-    "--since-git-sha",
-    "-i",
-    default=None,
-    is_flag=False,
-    help="Extracts modules changed since this git sha and updates them",
+    "--no-dangling-check",
+    default=False,
+    is_flag=True,
+    help="Not checking for dangling modules",
+)
+@click.option("--non-interactive", "-I", is_flag=True, help="Not interactive")
+@click.option(
+    "--recover-view-error",
+    is_flag=True,
+    help="Can happen if per update fields are removed and views still referencing this field.",
+)
+@click.option("--i18n", default=False, is_flag=True, help="Overwrite Translations")
+@pass_config
+@click.pass_context
+def update2(ctx, config, no_dangling_check, non_interactive, recover_view_error, i18n):
+    conn = config.get_odoo_conn()
+    revision = _get_setting(conn, KEY_SHA_REVISION)
+    Commands.invoke(
+        ctx,
+        "update",
+        no_outdated_modules=True,
+        since_git_sha=revision,
+        no_dangling_check=no_dangling_check,
+        non_interactive=non_interactive,
+        recover_view_error=recover_view_error,
+        i18n=i18n,
+    )
+
+
+@odoo_module.command()
+@click.argument(
+    "module", nargs=-1, required=False, shell_complete=_get_available_modules
 )
 @click.option(
     "--installed-modules",
@@ -431,7 +389,7 @@ def restore_web_icons(ctx, config):
     "-l",
     "--log",
     default="info",
-    type=click.Choice(["info", "debug", "error"]),
+    type=click.Choice(["test", "info", "debug", "error"]),
     help="display logs with given level",
 )
 @click.option(
@@ -446,9 +404,17 @@ def restore_web_icons(ctx, config):
     help="Can happen if per update fields are removed and views still referencing this field.",
 )
 @click.option(
+    "-O",
     "--no-outdated-modules",
     is_flag=True,
-    help="dont check for outdated modules (for migrations suitable)"
+    help="dont check for outdated modules (for migrations suitable)",
+)
+@click.option(
+    "--since-git-sha",
+    "-G",
+    default=None,
+    is_flag=False,
+    help="Extracts modules changed since this git sha and updates them",
 )
 @pass_config
 @click.pass_context
@@ -484,13 +450,22 @@ def update(
 
     To update all (custom) modules set "all" here
 
+    Sample call migration 13.0 -> 14.0:
+    OPTS="--no-dangling-check --config-file=config_migration --server-wide-modules=web,openupgrade_framework --additional-addons-paths=openupgrade"
+    odoo update $OPTS base
 
-    Sample call migration 14.0:
-    odoo update --no-dangling-check --config-file=config_migration --server-wide-modules=web,openupgrade_framework --additional-addons-paths=openupgrade base
-
+    # Real world sample:
+    odoo update $OPTS base
+    odoo update $OPTS mail
+    odoo psql --sql "delete from ir_ui_view where id in (1,2,3,4);"
+    odoo update $OPTS web
+    odoo update $OPTS sale_product_configurator
+    odoo update $OPTS hr
+    odoo update $OPTS stock
 
 
     """
+
     param_module = module
 
     if recover_view_error and not non_interactive:
@@ -532,18 +507,7 @@ def update(
         if since_git_sha and module:
             raise Exception("Conflict: since-git-sha and modules")
         if since_git_sha:
-            module = list(_get_changed_modules(since_git_sha))
-
-            # filter modules to defined ones in MANIFEST
-            click.secho(f"Following modules change since last sha: {' '.join(module)}")
-
-            module = list(filter(lambda x: x in MANIFEST()["install"], module))
-            click.secho(
-                (
-                    "Following modules change since last sha "
-                    f"(filtered to manifest): {' '.join(module)}"
-                )
-            )
+            module = _get_modules_since_git_sha(since_git_sha)
 
             if not module:
                 click.secho("No module update required - exiting.")
@@ -634,10 +598,12 @@ def update(
                     if recover_view_error:
                         try:
                             _try_to_recover_view_error(config, output)
-                        except RepeatUpdate:
-                            raise
+                        except RepeatUpdate as ex:
+                            _technically_update(ex.affected_modules)
                         except Exception as ex:
                             raise UpdateException(module) from ex
+                        else:
+                            raise Exception(f"Error at update - please check logs")
                     else:
                         raise UpdateException(module)
 
@@ -652,17 +618,24 @@ def update(
                     ("Error at /update_modules.py - " "aborting update process.")
                 ) from ex
 
+        trycount = 0
+        max_try_count = 5
         while True:
+            trycount += 1
             try:
                 if not no_outdated_modules:
                     outdated_modules = _get_outdated_modules()
                     if outdated_modules:
-                        click.secho(f"Outdated modules: {','.join(outdated_modules)}", fg='yellow')
-                        time.sleep(0.3)
+                        click.secho(
+                            f"Outdated modules: {','.join(outdated_modules)}",
+                            fg="yellow",
+                        )
                         _technically_update(outdated_modules)
                 _technically_update(module)
             except RepeatUpdate:
                 click.secho("Retrying update.")
+                if trycount >= max_try_count:
+                    raise
             else:
                 break
 
@@ -699,6 +672,18 @@ def update(
     if check_install_state:
         _do_check_install_state(ctx, config, module, all_modules, no_dangling_check)
 
+    _set_sha(config)
+
+
+def _set_sha(config):
+    conn = config.get_odoo_conn()
+    try:
+        sha = get_git_hash()
+    except:
+        pass
+    else:
+        _update_setting(conn, KEY_SHA_REVISION, sha)
+
 
 def _try_to_recover_view_error(config, output):
     """
@@ -706,20 +691,31 @@ def _try_to_recover_view_error(config, output):
     remove the item from the view.
 
     Field "product_not_show_ax_code" does not exist in model "res.company"
+
+    Field "dummy1" does not exist in model "res.partner"
+
+    View error context:
+    {'file': '/opt/src/odoo/addons/module_respartner_dummyfield2/partnerview.xml',
+    'line': 3,
+    'name': 'res.partner form',
+    'view': ir.ui.view(545,),
+    'view.model': 'res.partner',
+    'view.parent': ir.ui.view(128,),
+    'xmlid': 'view_res_partner_form'}
+
+    Caution: this view is just the one that updates; the conflicting view is not listed.
+    Just a select statement is created by the other view.
     """
     lines = output.splitlines()
 
-    for line in lines:
-        field = re.findall('Field "([^"]*?)" does not exist in model', line)
-        if field:
-            _execute_sql(
-                config.get_odoo_conn(),
-                (
-                    "update ir_ui_view set arch_db = replace(arch_db, "
-                    f"'{field[0]}', 'create_date')"
-                ),
+    for i, line in enumerate(lines):
+        match = re.findall('Field "([^"]*?)" does not exist in model "([^"]*?)"', line)
+        if match:
+            field, model = match[0]
+            affected_modules = _determine_affected_modules_for_ir_field_and_related(
+                config, field, model
             )
-            raise RepeatUpdate()
+            raise RepeatUpdate(affected_modules)
 
 
 def show_dangling():
@@ -750,7 +746,7 @@ def _do_check_install_state(ctx, config, module, all_modules, no_dangling_check)
                 problem_missing.add(module)
         if problem_missing:
             for missing in sorted(problem_missing):
-                click.secho("Missing: {missing}", fg="red")
+                click.secho(f"Missing: {missing}", fg="red")
             abort("Missing after installation")
 
 
@@ -780,7 +776,7 @@ def _do_dangling_check(ctx, config, dangling_modules, non_interactive):
                 ),
             )
     if DBModules.get_dangling_modules() and not dangling_modules:
-        if show_dangling():
+        if show_dangling() and not non_interactive:
             input("Abort old upgrade and continue? (Ctrl+c to break)")
             ctx.invoke(abort_upgrade)
 
@@ -827,6 +823,7 @@ def _uninstall_marked_modules(config, modules):
     for module in modules:
         click.secho(f"Uninstall {module}", fg="red")
         lib_shell(
+            config,
             (
                 "self.env['ir.module.module'].search(["
                 f"('name', '=', '{module}'),"
@@ -834,7 +831,7 @@ def _uninstall_marked_modules(config, modules):
                 "['to upgrade', 'to install', 'installed']"
                 ")]).module_uninstall()\n"
                 "self.env.cr.commit()"
-            )
+            ),
         )
         del module
 
@@ -882,20 +879,6 @@ def update_i18n(ctx, config, module, no_restart):
         Commands.invoke(ctx, "restart", machines=["odoo"])
 
 
-@odoo_module.command()
-@pass_config
-def progress(config):
-    """
-    Displays installation progress
-    """
-    for row in _execute_sql(
-        config.get_odoo_conn(),
-        "select state, count(*) from ir_module_module group by state;",
-        fetchall=True,
-    ):
-        click.echo("{}: {}".format(row[0], row[1]))
-
-
 @odoo_module.command(name="show-install-state")
 @pass_config
 def show_install_state(config, suppress_error=False, missing_as_error=False):
@@ -914,7 +897,7 @@ def show_install_state(config, suppress_error=False, missing_as_error=False):
 
     if not suppress_error:
         if dangling or (missing_as_error and missing):
-            raise Exception(
+            abort(
                 (
                     "Dangling modules detected - "
                     " please fix installation problems and retry! \n"
@@ -933,13 +916,6 @@ def show_addons_paths():
         click.echo(path)
 
 
-@odoo_module.command(name="pretty-print-manifest")
-def pretty_print_manifest():
-    from .odoo_config import MANIFEST
-
-    MANIFEST().rewrite()
-
-
 @odoo_module.command(name="show-conflicting-modules")
 def show_conflicting_modules():
     from .odoo_config import get_odoo_addons_paths
@@ -951,17 +927,18 @@ def _exec_update(config, params, non_interactive=False):
     params = ["odoo_update", "/update_modules.py"] + params
     if not non_interactive:
         yield __cmd_interactive(
+            config,
             *(
                 [
                     "run",
                     "--rm",
                 ]
                 + params
-            )
+            ),
         )
     else:
         try:
-            returncode, output = __dcrun(list(params), returnproc=True)
+            returncode, output = __dcrun(config, list(params), returnproc=True)
             yield returncode
             yield output
         except subprocess.CalledProcessError as ex:
@@ -1065,7 +1042,10 @@ def robotest(
     if odoo_modules:
 
         def not_installed(module):
-            return DBModules.get_meta_data(module)["state"] == "uninstalled"
+            data = DBModules.get_meta_data(module)
+            if not data:
+                abort(f"Could not get state for {module}")
+            return data["state"] == "uninstalled"
 
         modules_to_install = list(filter(not_installed, odoo_modules))
         if modules_to_install:
@@ -1123,7 +1103,7 @@ def robotest(
     workingdir = customs_dir() / (Path(os.getcwd()).relative_to(customs_dir()))
     os.chdir(workingdir)
 
-    __dcrun(params, pass_stdin=data.decode("utf-8"), interactive=True)
+    __dcrun(config, params, pass_stdin=data.decode("utf-8"), interactive=True)
 
     output_path = config.HOST_RUN_DIR / "odoo_outdir" / "robot_output"
     from .robo_helpers import _eval_robot_output
@@ -1270,7 +1250,7 @@ def unittest(
         params += ["--log-level=info"]
 
     try:
-        __dcrun(params, interactive=interactive)
+        __dcrun(config, params, interactive=interactive)
     except subprocess.CalledProcessError:
         pass
 
@@ -1299,36 +1279,6 @@ def unittest(
         sys.exit(-1)
 
 
-@odoo_module.command()
-@click.argument("name", required=True)
-@click.option("-Q", "--quick", is_flag=True)
-@pass_config
-@click.pass_context
-def set_ribbon(ctx, config, name, quick):
-    if not quick:
-        SQL = """
-            Select state from ir_module_module where name = 'web_environment_ribbon';
-        """
-        res = _execute_sql(config.get_odoo_conn(), SQL, fetchone=True)
-        if not (res and res[0] == "installed"):
-            Commands.invoke(
-                ctx, "update", module=["web_environment_ribbon"], no_dangling_check=True
-            )
-
-    _execute_sql(
-        config.get_odoo_conn(),
-        """
-        UPDATE
-            ir_config_parameter
-        SET
-            value = %s
-        WHERE
-            key = 'ribbon.name';
-    """,
-        params=(name,),
-    )
-
-
 @odoo_module.command(help="For directly installed odoos.")
 @pass_config
 @click.pass_context
@@ -1349,50 +1299,45 @@ def _get_changed_files(git_sha):
     filepaths2 = []
     cwd = Path(os.getcwd())
     for filepath in filepaths:
+        filepath = repo.path / filepath
         os.chdir(cwd)
-        submodule = [x for x in repo.submodules if x.path == filepath]
+
+        def get_submodule(filepath):
+            for submodule in repo.get_submodules():
+                try:
+                    filepath.relative_to(submodule.path)
+                    return submodule
+                except ValueError:
+                    continue
+
+        submodule = get_submodule(filepath)
+
         if submodule:
-            current_commit = str(repo.active_branch.commit)
+            current_commit = str(repo.hex)
+            relpath = filepath.relative_to(repo.path)
             old_commit = (
-                subprocess.check_output(["git", "rev-parse", f"{git_sha}:./{filepath}"])
-                .decode("utf-8")
+                subprocess.check_output(
+                    [
+                        "git",
+                        "rev-parse",
+                        f"{git_sha}:./{relpath}",
+                    ], encoding='utf8'
+                )
                 .strip()
             )
             new_commit = (
                 subprocess.check_output(
-                    ["git", "rev-parse", f"{current_commit}:./{filepath}"]
+                    ["git", "rev-parse", f"{current_commit}:./{relpath}"], encoding='utf8',
                 )
-                .decode("utf-8")
                 .strip()
             )
             # now diff the submodule
-            submodule_path = cwd / filepath
-            submodule_relative_path = filepath
-            for filepath2 in git_diff_files(submodule_path, old_commit, new_commit):
-                filepaths2.append(submodule_relative_path + "/" + filepath2)
+            for filepath2 in git_diff_files(filepath, old_commit, new_commit):
+                filepaths2.append(str(relpath / filepath2))
         else:
-            filepaths2.append(filepath)
+            filepaths2.append(str(filepath.relative_to(repo.path)))
 
     return filepaths2
-
-
-def _get_changed_modules(git_sha):
-    from .module_tools import Module
-
-    filepaths = _get_changed_files(git_sha)
-    modules = []
-    root = Path(os.getcwd())
-    for filepath in filepaths:
-
-        filepath = root / filepath
-
-        try:
-            module = Module(filepath)
-        except Module.IsNot:
-            pass
-        else:
-            modules.append(module.name)
-    return list(sorted(set(modules)))
 
 
 @odoo_module.command(name="list-changed-modules")
@@ -1433,21 +1378,6 @@ def _get_global_hash_paths(relative_to_customs_dir=False):
         return global_hash_paths
     return [p.relative_to(customs_dir_path) for p in global_hash_paths]
 
-
-def _clean_customs(ctx, config):
-    from .odoo_config import customs_dir
-
-    path = customs_dir()
-    if not config.force:
-        abort(
-            "Needs force option, because I call git clean -xdff and "
-            "all your work is lost. (Stashing before)"
-        )
-    if not is_git_clean(path):
-        subprocess.check_call(["git", "stash", "--include-untracked"], cwd=path)
-    subprocess.check_call(["git", "clean", "-xdff"], cwd=path)
-
-
 hash_cache = {}
 
 
@@ -1467,10 +1397,9 @@ def list_deps(ctx, config, module, no_cache):
 
     started = arrow.get()
     from .module_tools import Modules, DBModules, Module
+    from .module_tools import NotInAddonsPath
     from .odoo_config import customs_dir
     from .consts import FILE_DIRHASHES
-
-    _clean_customs(ctx, config)
 
     click.secho("Loading Modules...", fg="yellow")
     modules = Modules()
@@ -1483,10 +1412,10 @@ def list_deps(ctx, config, module, no_cache):
 
     result = {}
     for module in module:
-
         data = {"modules": []}
         data["modules"] = sorted(
-            map(lambda x: x.name, modules.get_module_flat_dependency_tree(module))
+            list(map(lambda x: x.name, modules.get_module_flat_dependency_tree(module)))
+            + [module.name]
         )
 
         data["auto_install"] = sorted(
@@ -1505,7 +1434,11 @@ def list_deps(ctx, config, module, no_cache):
         # get some hashes:
         paths = _get_global_hash_paths(True)
         for mod in data["modules"]:
-            paths.append(Module.get_by_name(mod).path)
+            try:
+                objmod = Module.get_by_name(mod)
+                paths.append(objmod.path)
+            except NotInAddonsPath:
+                pass
         for mod in data["auto_install"]:
             paths.append(Module.get_by_name(mod).path)
 
@@ -1577,6 +1510,110 @@ def list_modules(ctx, config):
         print(m)
 
 
-Commands.register(progress)
+@odoo_module.command()
+@pass_config
+@click.pass_context
+def list_outdated_modules(ctx, config):
+    modules = _get_default_modules_to_update()
+
+    def _get_outdated_modules(module):
+        return list(
+            map(
+                lambda x: x.name,
+                set(_get_outdated_versioned_modules_of_deptree(module)),
+            )
+        )
+
+    print("---")
+    for mod2 in _get_outdated_modules(modules):
+        print(mod2)
+
+
+def _get_modules_since_git_sha(sha):
+    from .odoo_config import MANIFEST
+
+    module = list(_get_changed_modules(sha))
+
+    # filter modules to defined ones in MANIFEST
+    click.secho(f"Following modules change since last sha: {' '.join(module)}")
+
+    module = list(filter(lambda x: x in MANIFEST()["install"], module))
+    click.secho(
+        (
+            "Following modules changed since last sha "
+            f"(filtered to manifest): {' '.join(module)}"
+        )
+    )
+    return module
+
+
+def _get_changed_modules(git_sha):
+    from .module_tools import Module
+
+    filepaths = _get_changed_files(git_sha)
+    modules = []
+    root = Path(os.getcwd())
+    for filepath in filepaths:
+        filepath = root / filepath
+
+        try:
+            module = Module(filepath)
+        except Module.IsNot:
+            pass
+        else:
+            modules.append(module.name)
+    return list(sorted(set(modules)))
+
+
+@odoo_module.command
+@click.option("-f", "--fix-not-in-manifest", is_flag=True)
+@click.option("--only-customs", is_flag=True)
+@pass_config
+def list_installed_modules(config, fix_not_in_manifest, only_customs):
+    from .module_tools import DBModules, Module
+    from .module_tools import NotInAddonsPath
+    from .odoo_config import customs_dir
+    from .odoo_config import MANIFEST
+
+    collected = []
+    not_in_manifest = []
+    manifest = MANIFEST()
+    setinstall = manifest.get("install", [])
+
+    for module in sorted(DBModules.get_all_installed_modules()):
+        try:
+            mod = Module.get_by_name(module)
+        except (Module.IsNot, NotInAddonsPath):
+            click.secho(f"Ignoring {module} - not found in source", fg="yellow")
+            continue
+        if only_customs:
+            try:
+                parts = mod.path.parts
+            except Module.IsNot:
+                click.secho(f"Ignoring {module} - not found in source", fg="yellow")
+                continue
+            if any(x in parts for x in ["odoo", "enterprise", "themes"]):
+                continue
+        try:
+            click.secho(f"{module}: {mod.path}", fg="green")
+            if not [x for x in setinstall if x == module]:
+                not_in_manifest.append(module)
+        except KeyError:
+            collected.append(module)
+
+    for module in not_in_manifest:
+        if fix_not_in_manifest:
+            setinstall += [module]
+            click.secho(f"Added to manifest: {module}", fg="green")
+        else:
+            click.secho(f"Not in MANIFEST: {module}", fg="yellow")
+    for module in collected:
+        click.secho(f"Not in filesystem: {module}", fg="red")
+
+    if fix_not_in_manifest:
+        manifest["install"] = setinstall
+        manifest.rewrite()
+
+
 Commands.register(update)
 Commands.register(show_install_state)

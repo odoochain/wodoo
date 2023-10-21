@@ -1,6 +1,9 @@
 # used to read and write to settings
+import uuid
 import sys
 from pathlib import Path
+from .tools import atomic_write
+
 
 def _get_ignore_case_item(d, k):
     try:
@@ -17,7 +20,6 @@ def _get_ignore_case_item(d, k):
 
 
 class MyConfigParser:
-
     def __init__(self, fileName, debug=False):
         if isinstance(fileName, dict):
             self.fileName = None
@@ -50,58 +52,58 @@ class MyConfigParser:
         for line in content.split("\n"):
             # If it isn't a comment get the variable and value and put it on a dict
             if not line.startswith("#") and len(line) > 1:
-                if '=' not in line:
+                if "=" not in line:
                     import click
-                    click.secho(f"Invalid configuration option '{line}' ignored.", fg='red')
+
+                    click.secho(
+                        f"Invalid configuration option '{line}' ignored.", fg="red"
+                    )
                     continue
-                (key, val) = line.rstrip('\n').split('=', 1)
+                (key, val) = line.rstrip("\n").split("=", 1)
                 val = val.strip()
-                val = val.strip('\"')
-                val = val.strip('\'')
+                val = val.strip('"')
+                val = val.strip("'")
                 self.configOptions[key.strip()] = val
 
     def write(self):
         handled_keys = set()
         if not self.fileName:
             return
-        try:
-            # Write the file contents
-            if not self.fileName.is_file():
-                self.fileName.parent.mkdir(exist_ok=True, parents=True)
-                self.fileName.write_text("")
-            with self.fileName.open("r+") as file:
-                lines = file.readlines()
-                # Truncate file so we don't need to close it and open it again
-                # for writing
-                file.seek(0)
-                file.truncate()
+        # Write the file contents
+        if not self.fileName.is_file():
+            self.fileName.parent.mkdir(exist_ok=True, parents=True)
 
-                def write_line(key, val):
-                    if val is None:
-                        import pudb;pudb.set_trace()
-                        raise Exception("None value not allowed for: {}".format(key))
-                    return key + "=" + str(val)
+        lines = []
+        if self.fileName.exists():
+            lines = self.fileName.read_text().splitlines()
 
-                # Loop through the file to change with new values in dict
-                for line in lines:
-                    if not line.startswith("#") and len(line) > 1:
-                        (key, val) = line.rstrip('\n').split('=', 1)
-                        key = key.strip()
-                        if key in self.configOptions:
-                            newVal = self.configOptions[key]
+        def format_line(key, val):
+            if val is None:
+                raise Exception("None value not allowed for: {}".format(key))
+            return key + "=" + str(val)
 
-                            # Only update if the variable value has changed
-                            if val != newVal:
-                                line = write_line(key, newVal)
-                        handled_keys.add(key)
-                    file.write(line.strip() + "\n")
-                for key in self.configOptions.keys():
-                    if key not in handled_keys:
-                        file.write(write_line(key, self.configOptions[key]).strip() + "\n")
-        except IOError as e:
-            print("ERROR opening file " + self.fileName + ": " + e.strerror + "\n")
+        # Loop through the file to change with new values in dict
+        def _update_lines():
+            for line in lines:
+                if line.startswith("#") or len(line) <= 1:
+                    yield line
+                    continue
+                (key, val) = line.rstrip("\n").split("=", 1)
+                key = key.strip()
+                if key in self.configOptions:
+                    newVal = self.configOptions[key]
 
-    # Redefinition of __getitem__ and __setitem__
+                    # Only update if the variable value has changed
+                line = format_line(key, newVal)
+                yield line
+                handled_keys.add(key)
+
+            for key in self.configOptions.keys():
+                if key not in handled_keys:
+                    yield format_line(key, self.configOptions[key])
+
+        with atomic_write(self.fileName) as file:
+            file.write_text("\n".join(_update_lines()) + "\n")
 
     def __getitem__(self, key):
         try:
@@ -115,10 +117,10 @@ class MyConfigParser:
 
     def __setitem__(self, key, value):
         if isinstance(value, list):
-            value_list = '('
+            value_list = "("
             for item in value:
-                value_list += ' \"' + item + '\"'
-            value_list += ' )'
+                value_list += ' "' + item + '"'
+            value_list += " )"
             self.configOptions[key] = value_list
         else:
             self.configOptions[key] = value

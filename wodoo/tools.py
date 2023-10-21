@@ -1,12 +1,14 @@
-import platform
+import uuid
+import time
 from subprocess import PIPE, STDOUT
 import hashlib
 import requests
 import stat
 from contextlib import contextmanager
 import re
-import docker
 import inquirer
+import cProfile
+import functools
 
 try:
     import arrow
@@ -66,14 +68,22 @@ class DBConnection(object):
     def get_psyco_connection(self, db=None):
         import psycopg2
 
-        conn = psycopg2.connect(
-            dbname=db or self.dbname,
-            user=self.user,
-            password=self.pwd,
-            host=self.host,
-            port=self.port or None,
-            connect_timeout=int(os.getenv("PSYCOPG_TIMEOUT", "3")),
-        )
+        while True:
+            try:
+                conn = psycopg2.connect(
+                    dbname=db or self.dbname,
+                    user=self.user,
+                    password=self.pwd,
+                    host=self.host,
+                    port=self.port or None,
+                    connect_timeout=int(os.getenv("PSYCOPG_TIMEOUT", "3")),
+                )
+                break
+            except psycopg2.OperationalError as ex:
+                if "database system is starting up" in str(ex):
+                    time.sleep(2)
+                else:
+                    raise
         return conn
 
     @contextmanager
@@ -232,6 +242,22 @@ def _exists_table(conn, table_name):
     return record[0]
 
 
+def docker_list_containers(project_name, service_name, status_filter=None):
+    cmd = [
+        "docker",
+        "ps",
+        "-a",
+        "-q",
+        "--no-trunc",
+        "--filter",
+        f"name=^/{project_name}_{service_name}$",
+    ]
+    if status_filter:
+        cmd += ["--filter", f"status={status_filter}"]
+    container_ids = subprocess.check_output(cmd, encoding="utf8").strip().splitlines()
+    return container_ids
+
+
 def _wait_postgres(config, timeout=600):
     started = arrow.get()
     if config.run_postgres:
@@ -253,17 +279,16 @@ def _wait_postgres(config, timeout=600):
             .splitlines()
         )
 
+        import docker
+
         client = docker.from_env()
         postgres_containers = []
         for container_id in container_ids:
             if not container_id:
                 continue
-            container = client.containers.get(container_id)
-            if not container:
-                continue
-            if not container.attrs["State"]["Running"]:
-                continue
-            postgres_containers += [container]
+            state = _docker_id_state(container_id)
+            if state == "running":
+                postgres_containers += [container_id]
 
         deadline = arrow.get().shift(seconds=timeout)
         last_ex = None
@@ -282,47 +307,63 @@ def _wait_postgres(config, timeout=600):
                 raise Exception(f"Timeout waiting postgres reached: {timeout}seconds")
             try:
                 _execute_sql(
-                    conn,
-                    sql="""
-                SELECT table_schema,table_name
-                FROM information_schema.tables
-                ORDER BY table_schema,table_name
-                LIMIT 1;
-                """,
+                    conn.clone(dbname="postgres"),
+                    sql=(
+                        " SELECT table_schema,table_name "
+                        " FROM information_schema.tables "
+                        " ORDER BY table_schema,table_name "
+                        " LIMIT 1; "
+                    ),
                 )
                 break
 
             except Exception as ex:
                 seconds = (arrow.get() - started).total_seconds()
-                if seconds > 5:
+                if seconds > 10:
                     if str(ex) != str(last_ex):
-                        click.secho(f"Waiting again for postgres. Last error is: {str(ex)}")
+                        click.secho(
+                            f"Waiting again for postgres. Last error is: {str(ex)}"
+                        )
                     last_ex = ex
                 time.sleep(1)
         click.secho("Postgres now available.", fg="green")
 
 
-def _is_container_running(machine_name):
-    import docker
+def _docker_id_state(container_id):
+    status = subprocess.check_output(
+        [
+            "docker",
+            "container",
+            "ls",
+            "--format",
+            "{{.State}}",
+            "--filter",
+            f"id={container_id}",
+        ],
+        encoding="utf8",
+    ).strip()
+    return status
 
-    container_id = __dc_out(["ps", "-q", machine_name]).strip()
+
+def docker_kill_container(container_id, remove=False):
+    subprocess.check_call(["docker", "kill", container_id])
+    if remove:
+        subprocess.check_call(["docker", "rm", container_id])
+
+
+def _is_container_running(config, machine_name):
+    container_id = __dc_out(config, ["ps", "-q", machine_name]).strip()
     if container_id:
-        container = list(
-            filter(
-                lambda container: container.id == container_id,
-                docker.from_env().containers.list(),
-            )
-        )
-        if container:
-            container = container[0]
-            return container.status == "running"
+        status = _docker_id_state(container_id)
+        if status:
+            return status == "running"
     return False
 
 
-def is_up(*machine_name):
+def is_up(config, *machine_name):
     assert len(machine_name) == 1
     click.echo(
-        "Running" if _is_container_running(machine_name[0]) else "Not Running",
+        "Running" if _is_container_running(config, machine_name[0]) else "Not Running",
         machine_name[0],
     )
 
@@ -399,21 +440,24 @@ def _set_default_envs(env):
     return env
 
 
-def __dc(cmd, env={}):
-    c = __get_cmd() + cmd
+def __dc(config, cmd, env={}):
+    ensure_project_name(config)
+    c = __get_cmd(config) + cmd
     env = _set_default_envs(env)
     return subprocess.check_call(c, env=_merge_env_dict(env))
 
 
-def __dc_out(cmd, env={}):
-    c = __get_cmd() + cmd
+def __dc_out(config, cmd, env={}):
+    ensure_project_name(config)
+    c = __get_cmd(config) + cmd
     env = _set_default_envs(env)
     return subprocess.check_output(c, env=_merge_env_dict(env))
 
 
-def __dcexec(cmd, interactive=True, env=None):
+def __dcexec(config, cmd, interactive=True, env=None):
+    ensure_project_name(config)
     env = _set_default_envs(env)
-    c = __get_cmd()
+    c = __get_cmd(config)
     c += ["exec"]
     if not interactive:
         c += ["-T"]
@@ -428,8 +472,15 @@ def __dcexec(cmd, interactive=True, env=None):
 
 
 def __dcrun(
-    cmd, interactive=False, env={}, returncode=False, pass_stdin=None, returnproc=False
+    config,
+    cmd,
+    interactive=False,
+    env={},
+    returncode=False,
+    pass_stdin=None,
+    returnproc=False,
 ):
+    ensure_project_name(config)
     env = _set_default_envs(env)
     cmd2 = [os.path.expandvars(x) for x in cmd]
     cmd = ["run"]
@@ -440,7 +491,7 @@ def __dcrun(
         cmd += ["-e{}={}".format(k, v)]
     cmd += cmd2
     del cmd2
-    cmd = __get_cmd() + cmd
+    cmd = __get_cmd(config) + cmd
     if interactive:
         optional_params = {}
         if pass_stdin:
@@ -503,20 +554,23 @@ def __rm_file_if_exists(path):
         path.unlink()
 
 
-def __rmtree(path):
-    config = _get_missing_click_config()
+def __rmtree(config, path):
+    path = str(path)
     if not path or path == "/":
         raise Exception("Not allowed: {}".format(path))
     if not path.startswith("/"):
         raise Exception("Not allowed: {}".format(path))
-    if not any(
-        path.startswith(config.dirs["odoo_home"] + x) for x in ["/tmp", "/run/"]
-    ):
-        if "/tmp" in path:
-            pass
-        else:
-            raise Exception("not allowed")
-    shutil.rmtree(path)
+    if config:
+        if not any(
+            path.startswith(str(config.dirs["odoo_home"]) + x)
+            for x in ["/tmp", "/run/"]
+        ):
+            if "/tmp" in path:
+                pass
+            else:
+                raise Exception("not allowed")
+    if Path(path).exists():
+        shutil.rmtree(path)
 
 
 def __safeget(array, index, exception_on_missing, file_options=None):
@@ -529,15 +583,14 @@ def __safeget(array, index, exception_on_missing, file_options=None):
     return array[index]
 
 
-def __get_cmd():
-    config = _get_missing_click_config()
+def __get_cmd(config):
     cmd = config.commands["dc"]
     cmd = [os.path.expandvars(x) for x in cmd]
     return cmd
 
 
-def __cmd_interactive(*params, return_proc=False):
-    cmd = __get_cmd() + list(params)
+def __cmd_interactive(config, *params, return_proc=False):
+    cmd = __get_cmd(config) + list(params)
     proc = subprocess.Popen(cmd)
     proc.wait()
     if return_proc:
@@ -575,8 +628,7 @@ def __file_get_lines(path):
     return path.read_text().strip().splitlines()
 
 
-def _get_machines():
-    config = _get_missing_click_config()
+def _get_machines(config):
     cmd = config.commands["dc"] + ["ps", "--services"]
     out = subprocess.check_output(cmd, cwd=config.dirs["odoo_home"])
     out = set(filter(lambda x: x, out.splitlines()))
@@ -655,7 +707,7 @@ def _get_user_primary_group(UID):
     return subprocess.check_output([id, "-gn", str(UID)], encoding="utf8").strip()
 
 
-def __try_to_set_owner(UID, path):
+def __try_to_set_owner(UID, path, abort_if_failed=True, verbose=False):
     primary_group = _get_user_primary_group(UID)
     find_command = f"find '{path}' -not -type l -not -user {UID}"
     res = (
@@ -669,25 +721,33 @@ def __try_to_set_owner(UID, path):
         .strip()
         .splitlines()
     )
+    res = sorted(list(res))
     if not res:
         return
-    for line in res:
-        if not line:
-            continue
+    for line in filter(bool, res):
         try:
             try:
-                shutil.chown(line, UID)
+                subprocess.check_output(["chown", str(UID), line])
             except:
-                click.secho(traceback.format_stack())
-                abort(f"Could not set owner {UID} " f"on directory {line}")
+                try:
+                    subprocess.check_output(["sudo", "chown", str(UID), line])
+                except Exception as ex:
+                    if abort_if_failed:
+                        abort(f"Could not set owner {UID} " f"on path {line}; \n\n{ex}")
 
             try:
-                shutil.chown(line, UID, primary_group)
+                subprocess.check_output(["chgrp", str(primary_group), line])
             except:
-                pass
+                try:
+                    subprocess.check_output(["sudo", "chgrp", str(primary_group), line])
+                except:
+                    pass
 
         except FileNotFoundError:
             continue
+        else:
+            if verbose:
+                click.secho(f"Setting ownership {UID} on {line}")
 
 
 def _display_machine_tips(config, machine_name):
@@ -784,38 +844,31 @@ def remove_webassets(conn):
     ignore_url_str = ""
     for url in urls_to_ignore:
         ignore_url_str += f" and url != '{url}'"
+
+    queries = [
+        f"delete from ir_attachment where res_model = 'ir.ui.view' and name ilike '%assets_%' {ignore_url_str};",
+        f"delete from ir_attachment where res_model = 'ir.ui.view' and name ilike '%web_editor.summernote%' {ignore_url_str};",
+        f"delete from ir_attachment where res_model = 'ir.ui.view' and name ilike '%.less%' {ignore_url_str};",
+        f"delete from ir_attachment where res_model = 'ir.ui.view' and name ilike '%.scss%' {ignore_url_str};",
+        f"delete from ir_attachment where name ilike '/web/%web%asset%' {ignore_url_str}",
+        f"delete from ir_attachment where name ilike 'import_bootstrap.less' {ignore_url_str}",
+        f"delete from ir_attachment where name ilike '%.less' {ignore_url_str}",
+        f"delete from ir_attachment where name ilike '%.scss' {ignore_url_str}",
+        f"delete from ir_attachment where name ilike 'web_icon_data' {ignore_url_str}",
+        f"delete from ir_attachment where name ilike 'web_editor.summernote.%' {ignore_url_str}",
+        f"delete from ir_attachment where name ilike 'web.assets_backend_prod_only.js'",
+        # following is like odoo 16:
+        f"delete from ir_attachment where name ilike '%.assets_%.css' and res_model = 'ir.ui.view'",
+        f"delete from ir_attachment where name ilike '%.assets_%.js' and res_model = 'ir.ui.view'",
+    ]
     try:
-        cr.execute(
-            f"delete from ir_attachment where res_model = 'ir.ui.view' and name ilike '%assets_%' {ignore_url_str};"
-        )
-        cr.execute(
-            f"delete from ir_attachment where res_model = 'ir.ui.view' and name ilike '%web_editor.summernote%' {ignore_url_str};"
-        )
-        cr.execute(
-            f"delete from ir_attachment where res_model = 'ir.ui.view' and name ilike '%.less%' {ignore_url_str};"
-        )
-        cr.execute(
-            f"delete from ir_attachment where res_model = 'ir.ui.view' and name ilike '%.scss%' {ignore_url_str};"
-        )
-        cr.execute(
-            f"delete from ir_attachment where name ilike '/web/%web%asset%' {ignore_url_str}"
-        )
-        cr.execute(
-            f"delete from ir_attachment where name ilike 'import_bootstrap.less' {ignore_url_str}"
-        )
-        cr.execute(
-            f"delete from ir_attachment where name ilike '%.less' {ignore_url_str}"
-        )
-        cr.execute(
-            f"delete from ir_attachment where name ilike '%.scss' {ignore_url_str}"
-        )
-        cr.execute(
-            f"delete from ir_attachment where name ilike 'web_icon_data' {ignore_url_str}"
-        )
-        cr.execute(
-            f"delete from ir_attachment where name ilike 'web_editor.summernote.%' {ignore_url_str}"
-        )
-        conn.commit()
+        for query in queries:
+            try:
+                click.secho(query, fg="grey")
+                cr.execute(query)
+                conn.commit()
+            except:
+                continue
     finally:
         cr.close()
         conn.close()
@@ -880,13 +933,14 @@ def __hash_odoo_password(pwd):
     from .odoo_config import current_version
 
     if current_version() in [
+        9.0,
+        10.0,
         11.0,
         12.0,
         13.0,
         14.0,
         15.0,
-        10.0,
-        9.0,
+        16.0,
     ]:
         setpw = CryptContext(schemes=["pbkdf2_sha512", "md5_crypt"])
         return setpw.encrypt(pwd)
@@ -914,18 +968,32 @@ def sync_folder(dir, dest_dir, excludes=None):
         raise NotImplementedError()
 
 
+def rsync(src, dest, options="-ar", exclude=None):
+    exclude = exclude or ""
+    exclude_option = []
+    for x in exclude:
+        exclude_option += ["--exclude", x]
+    if not isinstance(options, list):
+        options = [options]
+    subprocess.check_call(
+        ["rsync", str(src) + "/", str(dest) + "/"] + options + exclude_option
+    )
+
+
 def copy_dir_contents(dir, dest_dir, exclude=None):
     assert dir.is_dir()
     assert dest_dir.is_dir()
     exclude = exclude or []
-    for x in dir.glob("*"):
+    files = list(dir.glob("*"))
+    for x in files:
         if exclude:
             if x.name in exclude:
                 continue
+        dest_path = (dest_dir / x.name).absolute()
         if not x.is_dir():
-            shutil.copy(str(x.absolute()), str((dest_dir / x.name).absolute()))
+            shutil.copy(str(x.absolute()), str(dest_path))
         else:
-            shutil.copytree(str(x.absolute()), str((dest_dir / x.name).absolute()))
+            shutil.copytree(str(x.absolute()), str(dest_path))
 
 
 def _get_host_ip():
@@ -935,49 +1003,14 @@ def _get_host_ip():
         return conn[2]
 
 
-def _is_dirty(repo, check_submodule, assert_clean=False):
-    from git import Repo
-    from git import InvalidGitRepositoryError
-    from git import NoSuchPathError
-
-    def raise_error():
-        if assert_clean:
-            click.secho(
-                ("Dirty directory - please cleanup: {repo.working_dir}"),
-                bold=True,
-                fg="red",
-            )
-            sys.exit(42)
-
-    if repo.is_dirty() or repo.untracked_files:
-        raise_error()
-        return True
-    if check_submodule:
-        try:
-            repo.submodules
-        except AttributeError:
-            pass
-        else:
-            for submodule in repo.submodules:
-                try:
-                    sub_repo = Repo(submodule.path)
-                except InvalidGitRepositoryError:
-                    click.secho(f"Invalid Repo: {submodule}", bold=True, fg="red")
-                except NoSuchPathError:
-                    click.secho(f"Invalid Repo: {submodule}", bold=True, fg="red")
-                else:
-                    if _is_dirty(sub_repo, True, assert_clean=assert_clean):
-                        raise_error()
-                        return True
-    return False
-
-
 def __assure_gitignore(gitignore_file, content):
     p = Path(gitignore_file)
     if not p.exists():
-        p.write(content + "\n")
+        p.write_text(content + "\n")
         return
-    exists = [l for l in gitignore_file.read_text().split("\n") if l.strip() == content]
+    exists = [
+        l for l in gitignore_file.read_text().splitlines() if l.strip() == content
+    ]
     if not exists:
         with p.open("a") as f:
             f.write(content)
@@ -1021,6 +1054,9 @@ def measure_time(method):
 
 
 def _extract_python_libname(x):
+    if "@" in x:
+        # return vcs refs
+        return x
     regex = re.compile(r"[\w\-\_]*")
     x = x.replace("-", "_")
     match = re.findall(regex, x)[0]
@@ -1052,17 +1088,6 @@ def split_hub_url(config):
         "username": username,
         "prefix": prefix,
     }
-
-
-def _get_missing_click_config():
-    from .click_config import Config
-
-    config = Config(quiet=True)
-    for stack in inspect.stack():
-        frame = stack.frame
-        if "ctx" in frame.f_locals and "config" in frame.f_locals:
-            config = frame.f_locals["config"]
-    return config
 
 
 def execute_script(config, script, message):
@@ -1121,9 +1146,20 @@ def get_hash(text):
     return hashlib.sha1(text).hexdigest()
 
 
+def remove_pycs(path):
+    path = path.absolute()
+    if not path.is_dir():
+        return
+    for cachedir in bashfind(path, name="__pycache__", type="d"):
+        shutil.rmtree(cachedir)
+    for file in bashfind(path, name="*.pyc", type="f"):
+        file.unlink()
+
+
 def get_directory_hash(path):
     click.secho(f"Calculating hash for {path}", fg="yellow")
     # "-N required because absolute path is used"
+    remove_pycs(path)
     hex = (
         subprocess.check_output(
             ["dtreetrawl", "-N", "--hash", "-R", path], encoding="utf8"
@@ -1136,14 +1172,17 @@ def get_directory_hash(path):
 
 
 def git_diff_files(path, commit1, commit2):
+    params = [
+        "git",
+        "diff",
+        "--name-only",
+    ]
+    if commit1:
+        params += [commit1]
+    if commit2:
+        params += [commit2]
     output = subprocess.check_output(
-        [
-            "git",
-            "diff",
-            "--name-only",
-            commit1,
-            commit2,
-        ],
+        params,
         encoding="utf8",
         cwd=path,
     )
@@ -1160,11 +1199,30 @@ def _binary_zip(folder, destpath):
         raise Exception(f"file {destpath} not generated")
 
 
+def try_ignore_exceptions(execute, exceptions, timeout=10):
+    started = arrow.get()
+    while True:
+        try:
+            execute()
+        except exceptions:
+            if (arrow.get() - started).total_seconds() > timeout:
+                raise
+            else:
+                time.sleep(0.5)
+        except Exception:
+            raise
+        else:
+            break
+
+
 @contextmanager
-def autocleanpaper(filepath=None):
-    filepath = Path(filepath or tempfile._get_default_tempdir()) / next(
-        tempfile._get_candidate_names()
-    )
+def autocleanpaper(filepath=None, strict=False):
+    if strict:
+        assert filepath
+    else:
+        filepath = Path(filepath or tempfile._get_default_tempdir()) / next(
+            tempfile._get_candidate_names()
+        )
 
     try:
         yield filepath
@@ -1205,7 +1263,9 @@ def get_filesystem_of_folder(path):
 
 def get_git_hash(path=None):
     return subprocess.check_output(
-        ["git", "log", "-n", "1", "--format=%H"], cwd=path or os.getcwd()
+        ["git", "log", "-n", "1", "--format=%H"],
+        cwd=path or os.getcwd(),
+        encoding="utf8",
     ).strip()
 
 
@@ -1272,3 +1332,230 @@ def download_file(url):
     finally:
         if file.exists():
             file.unlink()
+
+
+def _get_default_project_name(restrict):
+    from .exceptions import NoProjectNameException
+
+    def _get_project_name_from_file(path):
+        path = Path(path)
+        if not path.exists():
+            return
+        pj = [x for x in path.read_text().split("\n") if "PROJECT_NAME" in x]
+        if pj:
+            return pj[0].split("=")[-1].strip()
+
+    if restrict:
+        paths = restrict
+    else:
+        paths = [Path(os.path.expanduser("~/.odoo/settings"))]
+
+    for path in paths:
+        pj = _get_project_name_from_file(path)
+        if pj:
+            return pj
+
+    customs_root = _get_customs_root(Path(os.getcwd()))
+    if customs_root:
+        root = Path(customs_root)
+        if (root / "MANIFEST").exists():
+            return root.name
+    raise NoProjectNameException("No default project name could be determined.")
+
+
+def _search_path(filename):
+    filename = Path(filename)
+    filename = filename.name
+    paths = os.getenv("PATH", "").split(":")
+
+    # add probable pyenv path also:
+    execparent = Path(sys.executable).parent
+    if execparent.name in ["bin", "sbin"]:
+        paths = [execparent] + paths
+
+    for path in paths:
+        path = Path(path)
+        if (path / filename).exists():
+            return str(path / filename)
+
+
+def _get_customs_root(p):
+    # arg_dir = p
+    if p:
+        while len(p.parts) > 1:
+            if (p / "MANIFEST").exists():
+                return p
+            p = p.parent
+
+
+def _shell_complete_file(ctx, param, incomplete):
+    incomplete = os.path.expanduser(incomplete)
+    if not incomplete:
+        start = Path(os.getcwd())
+    else:
+        start = Path(incomplete).parent
+    parts = list(filter(bool, incomplete.split("/")))
+    if Path(incomplete).exists() and Path(incomplete).is_dir():
+        start = Path(incomplete)
+        filtered = "*"
+    else:
+        filtered = "*"
+        if parts:
+            filtered = parts[-1] + "*"
+    files = list(start.glob(filtered))
+    return sorted(map(str, files))
+
+
+def ensure_project_name(config):
+    if not config.project_name:
+        abort("Project name missing.")
+
+
+def _get_filestore_folder(config):
+    return config.dirs["odoo_data_dir"] / "filestore" / config.dbname
+
+
+def _write_file(file, content):
+    s = ""
+    if file.exists():
+        s = file.read_text()
+    if s != content:
+        file.write_text(content)
+        return True
+    return False
+
+
+def _make_sure_module_is_installed(ctx, config, modulename, repo_url):
+    from .module_tools import DBModules
+    from .odoo_config import MANIFEST
+    from .odoo_config import current_version
+    from .cli import cli, pass_config, Commands
+    from gimera.gimera import add as gimera_add
+    from gimera.gimera import apply as gimera_apply
+
+    state = DBModules.get_meta_data(modulename)
+    if state["state"] == "installed":
+        return
+
+    path = Path("addons_wodoo") / modulename
+    if not path.exists():
+        ctx.invoke(
+            gimera_add,
+            url=repo_url,
+            path=str(path),
+            branch=str(current_version()),
+            type="integrated",
+        )
+        ctx.invoke(gimera_apply, repos=str(path))
+
+    # if not yet there, then pack into "addons_framework"
+    manifest = MANIFEST()
+    addons_paths = manifest.get("addons_paths", [])
+    install = manifest.get("install", [])
+    if modulename not in install:
+        install += [modulename]
+    manifest["install"] = install
+
+    if str(path) not in addons_paths:
+        addons_paths += [str(path)]
+        manifest["addons_paths"] = addons_paths
+
+    manifest.rewrite()
+
+    Commands.invoke(
+        ctx,
+        "update",
+        module=[modulename],
+        no_restart=False,
+        no_dangling_check=True,
+        no_update_module_list=False,
+        non_interactive=True,
+    )
+
+
+def bashfind(path, name=None, wholename=None, type=None):
+    cmd = [
+        "find",
+    ]
+    if type:
+        cmd += [
+            "-type",
+            type,
+        ]
+    if wholename:
+        cmd += ["-wholename", wholename]
+    if name:
+        cmd += ["-name", name]
+    if not Path(path).exists():
+        return []
+    files = subprocess.check_output(cmd, cwd=path, encoding="utf8").splitlines()
+    return list(map(lambda x: Path(path) / x, files))
+
+
+def _update_setting(conn, key, value):
+    value = str(value)
+    row = _execute_sql(
+        conn,
+        f"SELECT value FROM ir_config_parameter WHERE key = '{key}'",
+        fetchone=True,
+    )
+    if not row:
+        _execute_sql(
+            conn,
+            f"INSERT INTO ir_config_parameter(key, value, create_date, write_date) values('{key}', '{value}', now(), now());",
+        )
+    else:
+        _execute_sql(
+            conn,
+            f"UPDATE ir_config_parameter SET value = '{value}' where key = '{key}'",
+        )
+
+
+def _get_setting(conn, key):
+    rec = _execute_sql(
+        conn,
+        f"SELECT value FROM ir_config_parameter WHERE key = '{key}'",
+        fetchone=True,
+    )
+    if rec:
+        return rec[0]
+
+
+@contextmanager
+def cwd(path):
+    remember = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(remember)
+
+
+@contextmanager
+def atomic_write(file):
+    tempfile = file.parent / f"{file.name}.{uuid.uuid4()}"
+    try:
+        yield tempfile
+
+        if file.exists():
+            file.unlink()
+        tempfile.rename(file)
+
+    except Exception:
+        if tempfile.exists():
+            try:
+                tempfile.unlink()
+            except Exception:
+                pass
+
+
+def pretty_xml(xmlstring):
+    with autocleanpaper() as tempfile:
+        tempfile.write_bytes(xmlstring)
+        formatted = subprocess.check_output(
+            ["xmllint", "--format", tempfile],
+            env={
+                "XMLLINT_INDENT": "    ",
+            },
+        )
+        return formatted

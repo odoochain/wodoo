@@ -26,7 +26,7 @@ from .tools import __dc
 from .tools import _get_host_ip
 from .tools import __needs_docker
 import subprocess
-from . import Commands
+from .cli import Commands
 
 
 def _get_volume_hostpath(volume):
@@ -69,7 +69,7 @@ def _get_volume_size(volume):
 
 
 def _start_postgres_before(config):
-    __dc(["up", "-d", "postgres"])
+    __dc(config, ["up", "-d", "postgres"])
     _wait_postgres(config)
 
 
@@ -90,7 +90,7 @@ def dev(ctx, config, build, kill):
         do_kill(ctx, config, machines=[], brutal=True)
         rm(ctx, config, machines=[])
     _start_postgres_before(config)
-    __dc(["up", "-d"])
+    __dc(config, ["up", "-d"])
     Commands.invoke(ctx, "kill", machines=["odoo"])
     ip = _get_host_ip()
     proxy_port = myconfig["PROXY_PORT"]
@@ -115,14 +115,14 @@ def dev(ctx, config, build, kill):
     Commands.invoke(ctx, "debug", machine="odoo")
 
 
-def ps():
+def ps(config):
     args = ["ps", "-a"]
-    __dc(args)
+    __dc(config, args)
 
 
-def execute(machine, args):
+def execute(config, machine, args):
     args = [machine] + list(args)
-    __dcexec(args)
+    __dcexec(config, args)
 
 
 def do_kill(ctx, config, machines=[], brutal=False):
@@ -143,15 +143,15 @@ def do_kill(ctx, config, machines=[], brutal=False):
         safe_stop = []
         for machine in SAFE_KILL:
             if not machines or machine in machines:
-                if _is_container_running(machine):
+                if _is_container_running(config, machine):
                     safe_stop += [machine]
 
         if safe_stop:
-            __dc(["stop", "-t 20"] + safe_stop)  # persist data
+            __dc(config, ["stop", "-t 20"] + safe_stop)  # persist data
     if config.devmode:
-        __dc(["kill"] + list(machines))
+        __dc(config, ["kill"] + list(machines))
     else:
-        __dc(["stop", "-t 2"] + list(machines))
+        __dc(config, ["stop", "-t 2"] + list(machines))
 
 
 def force_kill(ctx, config, machine):
@@ -170,7 +170,7 @@ def wait_for_port(host, port):
 
 def recreate(ctx, config, machines=[]):
     machines = list(machines)
-    __dc(["up", "--no-start", "--force-recreate"] + machines)
+    __dc(config, ["up", "--no-start", "--force-recreate"] + machines)
 
 
 def up(ctx, config, machines=[], daemon=False, remove_orphans=True):
@@ -187,7 +187,7 @@ def up(ctx, config, machines=[], daemon=False, remove_orphans=True):
 
     if not machines and config.run_postgres and daemon and config.USE_DOCKER:
         _start_postgres_before(config)
-    __dc(["up"] + options + machines)
+    __dc(config, ["up"] + options + machines)
 
 
 def down(ctx, config, machines=[], volumes=False, remove_orphans=True):
@@ -199,7 +199,10 @@ def down(ctx, config, machines=[], volumes=False, remove_orphans=True):
         options += ["--volumes"]
     if remove_orphans:
         options += ["--remove-orphans"]
-    __dc(["down"] + options + machines)
+    __dc(config, ["down"] + options + machines)
+
+    if volumes:
+        Commands.invoke(ctx, "remove-volumes")
 
 
 def stop(ctx, config, machines=[]):
@@ -221,7 +224,7 @@ def restart(ctx, config, machines=[]):
 def rm(ctx, config, machines=[]):
     __needs_docker(config)
     machines = list(machines)
-    __dc(["rm", "-f"] + machines)
+    __dc(config, ["rm", "-f"] + machines)
 
 
 def attach(ctx, config, machine):
@@ -231,11 +234,11 @@ def attach(ctx, config, machine):
     __needs_docker(config)
     _display_machine_tips(config, machine)
     bash = _get_bash_for_machine(machine)
-    __cmd_interactive("exec", machine, bash)
+    __cmd_interactive(config, "exec", machine, bash)
 
 
 def pull(ctx, config):
-    __dc(["pull"])
+    __dc(config, ["pull"])
 
 
 def build(ctx, config, machines=[], pull=False, no_cache=False, push=False):
@@ -254,6 +257,7 @@ def build(ctx, config, machines=[], pull=False, no_cache=False, push=False):
         os.environ["BUILDKIT_PROGRESS"] = "plain"
 
     __dc(
+        config,
         ["build"] + options + list(machines),
         env={
             "ODOO_VERSION": config.odoo_version,  # at you developer: do not mismatch with build args
@@ -295,11 +299,11 @@ def debug(ctx, config, machine, ports, cmd=None):
 
         cmd_prefix += ["-f", dest]
 
-    __dc(cmd_prefix + ["up", "-d", machine])
+    __dc(config, cmd_prefix + ["up", "-d", machine])
     if not cmd:
         attach(ctx, config, machine=machine)
     else:
-        __dcexec([machine, cmd], interactive=True)
+        __dcexec(config, [machine, cmd], interactive=True)
 
 
 def run(ctx, config, machine, args, **kwparams):
@@ -310,7 +314,7 @@ def run(ctx, config, machine, args, **kwparams):
     if args and args[0] == "bash" and len(args) == 1:
         runbash(ctx, config, machine=machine)
         return
-    __dcrun([machine] + list(args), **kwparams)
+    __dcrun(config, [machine] + list(args), **kwparams)
 
 
 def runbash(ctx, config, machine, args, **kwparams):
@@ -321,27 +325,26 @@ def runbash(ctx, config, machine, args, **kwparams):
         cmd += args
     else:
         cmd += [bash]
-    __cmd_interactive(*tuple(cmd))
+    __cmd_interactive(config, *tuple(cmd))
 
 
-def logall(machines, follow, lines):
+def logall(config, machines, follow, lines):
     cmd = ["logs"]
     if follow:
         cmd += ["-f"]
     if lines:
         cmd += [f"--tail={lines}"]
     cmd += list(machines)
-    __dc(cmd)
+    __dc(config, cmd)
 
 
-def shell(command="", queuejobs=False):
+def shell(config, command="", queuejobs=False):
     cmd = [
         "run",
         "--rm",
         "odoo",
-        "python3",
         "/odoolib/shell.py",
     ]
     if queuejobs:
         cmd += ["--queuejobs"]
-    __cmd_interactive(*(cmd + [command]))
+    __cmd_interactive(config, *(cmd + [command]))

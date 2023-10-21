@@ -19,6 +19,7 @@ import time
 import subprocess
 from os.path import expanduser
 from .consts import VERSIONS
+from .tools import abort
 
 try:
     import psycopg2
@@ -36,7 +37,10 @@ def get_odoo_addons_paths(
     if additional_addons_paths:
         addons_paths += additional_addons_paths
 
-    MUST = ["odoo/odoo/addons", "odoo/addons"]
+    if current_version() <= 9.0:
+        MUST = ["odoo/openerp/addons", "odoo/addons"]
+    else:
+        MUST = ["odoo/odoo/addons", "odoo/addons"]
     for must in reversed(MUST):
         if must in addons_paths:
             continue
@@ -51,114 +55,7 @@ def get_odoo_addons_paths(
         else:
             res.append(c / x)
 
-
     return res
-
-
-def _identify_odoo_addons_paths(show_conflicts=True):
-    from .module_tools import Module
-
-    folders = []
-    c = customs_dir()
-
-    modules = []
-
-    def _get_modules_in_folder(folder):
-        # find extra modules without repo
-        for file in folder.glob("**/{}".format(MANIFEST_FILE())):
-            if ".git" in file.parts:
-                continue
-            file = file.resolve().absolute()
-            if file.parent.parent in folders:
-                continue
-            if any(x in file.relative_to(c).parts for x in {"test", "tests", ".git"}):
-                continue
-            try:
-                module = Module(file)
-            except Module.IsNot:
-                continue
-            if module.in_version:
-                if module.path.parent not in folders:
-                    folders.append(module.path.parent)
-                    modules.append(module)
-            del file
-
-    manifest = MANIFEST()
-
-    oca_addons = [
-        "addons_oca",
-        "OCA",
-        "addons_OCA",
-        "*OCA",
-    ]
-    for oca in oca_addons:
-        if oca not in os.listdir(c):
-            continue
-
-        for oca_folder in list(c.glob(oca)):  # case insensitive on windows / macos
-            _get_modules_in_folder(oca_folder)
-            del oca_folder
-        del oca
-
-    for module in manifest["modules"]:
-        for url in module["urls"]:
-            repo_name = url.split("/")[-1].replace(".git", "")
-            path = c / Path(module["path"]) / repo_name
-            _get_modules_in_folder(path)
-            del url
-        del module
-
-    folders = list(reversed(folders))
-    for odoo_folder in filter(
-        lambda x: x.exists(),
-        map(
-            Path,
-            [
-                c / "odoo" / "openerp" / "addons",  # backwards compatibility
-                c / "odoo" / "addons",
-                c / "odoo" / "odoo" / "addons",
-            ],
-        ),
-    ):
-        if not odoo_folder.exists():
-            continue
-        _get_modules_in_folder(odoo_folder)
-        del odoo_folder
-    folders = list(reversed(folders))
-    _get_modules_in_folder(c)
-
-    if show_conflicts:
-        _detect_duplicate_modules(folders, modules)
-
-    return folders
-
-
-def _detect_duplicate_modules(folders, modules):
-    from .module_tools import Module
-
-    check_modules = {}
-    c = customs_dir()
-    for folder in folders:
-        folder_rel = folder.relative_to(c)
-        modules_in_folder = [
-            x for x in modules if str(x.path.relative_to(c)).startswith(str(folder_rel))
-        ]
-        for module in modules_in_folder:
-            check_modules.setdefault(module.name, [])
-            if module.path not in [x.path for x in check_modules[module.name]]:
-                check_modules[module.name].append(module)
-
-    for v in filter(lambda x: len(x) > 1, check_modules.values()):
-        click.echo(
-            click.style(
-                "Overridden Module: {}".format(v[0].name), bold=True, fg="green"
-            )
-        )
-        for i, module in enumerate(v):
-            styles = dict(bold=True) if not i else {}
-            s = str(module.path.relative_to(c))
-            click.echo(click.style(s, **styles))
-    time.sleep(2)
 
 
 def customs_dir():
@@ -234,11 +131,14 @@ class MANIFEST_CLASS(object):
         self._update(data)
 
     def _update(self, d):
-        d["install"] = list(sorted(d["install"]))
+        d["install"] = list(sorted(set(d["install"])))
         s = json.dumps(d, indent=4)
         tfile = Path(tempfile.mktemp(suffix=".MANIFEST"))
         tfile.write_text(s)
         shutil.move(tfile, MANIFEST_FILE())
+
+        if len(set(d["addons_paths"])) != len(d["addons_paths"]):
+            abort("Addons Paths contains duplicate entries!")
 
     def rewrite(self):
         self._update(self._get_data())
@@ -248,8 +148,13 @@ def MANIFEST():
     return MANIFEST_CLASS()
 
 
+cache_version = {}
+
+
 def current_version():
-    return float(MANIFEST()["version"])
+    if cache_version.get("value") is None:
+        cache_version["value"] = float(MANIFEST()["version"])
+    return cache_version["value"]
 
 
 def get_postgres_connection_params(inside_container=None):

@@ -5,7 +5,7 @@ import inquirer
 from .tools import remove_webassets
 from .tools import _askcontinue
 from .tools import get_volume_names
-from . import cli, pass_config, Commands
+from .cli import cli, pass_config, Commands
 from .lib_clickhelpers import AliasedGroup
 from .tools import __hash_odoo_password
 from .tools import _remove_postgres_connections, _execute_sql
@@ -18,6 +18,7 @@ def _decide_snapshots_possible(config):
     ttype = get_filesystem_of_folder("/var/lib/docker")
     if ttype in ["zfs", "btrfs"]:
         return ttype
+
 
 def _setup_manager(config):
     ttype = _decide_snapshots_possible(config)
@@ -111,11 +112,13 @@ def snapshot_remove(ctx, config, name):
 def snapshot_clear_all(ctx, config):
     config.snapshot_manager.assert_environment(config)
 
-    snapshots = config.snapshot_manager.__get_snapshots(config)
-    if snapshots:
-        for snap in snapshots:
-            config.snapshot_manager.remove(config, snap)
-    config.snapshot_manager.clear_all(config)
+    if hasattr(config.snapshot_manager, 'clear_all'):
+        config.snapshot_manager.clear_all(config)
+    else:
+        snapshots = config.snapshot_manager.__get_snapshots(config)
+        if snapshots:
+            for snap in snapshots:
+                config.snapshot_manager.remove(config, snap)
     ctx.invoke(do_list)
 
 

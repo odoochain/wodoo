@@ -1,4 +1,5 @@
 import arrow
+import pprint
 import json
 import click
 import iscompatible
@@ -8,11 +9,16 @@ import pickle
 import os
 import shutil
 import uuid
+from gimera.repo import Repo
 from .tools import get_hash, get_git_hash
 from .tools import __try_to_set_owner as try_to_set_owner
 from .tools import measure_time
 from .tools import is_git_clean
 from .tools import whoami
+from .tools import abort
+from .tools import __rmtree as rmtree
+from .tools import pretty_xml
+from .tools import bashfind
 
 try:
     from psycopg2 import IntegrityError
@@ -45,7 +51,6 @@ except Exception:
     from xmlrpc import client as xmlrpclib
 import inspect
 import sys
-from .tools import _get_missing_click_config
 
 LANG = os.getenv("ODOO_LANG", "de_DE")  # todo from environment
 host = "http://localhost:8069"
@@ -54,6 +59,16 @@ username = "admin"
 pwd = "1"
 
 name_cache = {}
+remark_about_missing_module_info = set()
+dep_tree_cache = {}
+Modules_Cache = {}
+
+
+def module_or_string(module):
+    if isinstance(module, str):
+        return module
+    if isinstance(module, Module):
+        return module.name
 
 
 class NotInAddonsPath(Exception):
@@ -73,7 +88,6 @@ def exe(*params):
 
 
 def delete_qweb(config, modules):
-
     with get_conn_autoclose(config) as cr:
         if modules != "all":
             cr.execute("select name from ir_module_module where name = %s", (modules,))
@@ -135,8 +149,20 @@ def get_all_langs(config):
     return langs
 
 
-def get_modules_from_install_file():
-    return MANIFEST()["install"]
+def get_modules_from_install_file(include_uninstall=False):
+    res = MANIFEST().get("install", [])
+    if include_uninstall:
+        for mod in MANIFEST().get('uninstall', []):
+            try:
+                Module.get_by_name(mod)
+            except (NotInAddonsPath, Module.IsNot, KeyError):
+                click.secho(
+                    f"WARNING: module {mod} cannot be uninstalled - "
+                    "not found in source", fg='yellow')
+                pass
+            else:
+                res += [mod]
+    return res
 
 
 class DBModules(object):
@@ -314,7 +340,8 @@ class DBModules(object):
             return state[1] in ["installed", "to upgrade"]
 
 
-def make_customs(path):
+def make_customs(ctx, path):
+    from gimera.gimera import apply as gimera
     from .tools import abort
     import click
 
@@ -324,7 +351,6 @@ def make_customs(path):
         abort("Path is not empty: {}".format(path))
 
     import inquirer
-    from git import Repo
     from .tools import copy_dir_contents
 
     dir = get_template_dir()
@@ -348,16 +374,16 @@ def make_customs(path):
 
     manifest_file = path / "MANIFEST"
     manifest = eval(manifest_file.read_text())
+    raise Exception("Rewrite to use gimera")
 
     click.echo("Checking for odoo repo at env variable 'ODOO_REPO'")
     if os.getenv("ODOO_REPO", ""):
         odoo_path = path / "odoo"
         repo_path = Path(os.environ["ODOO_REPO"])
         repo = Repo(repo_path)
-        repo.git.checkout(str(version))
+        repo.X("git", "checkout", str(version))
         odoo_path.mkdir()
-        sha = repo.head.object.hexsha
-        sha = repo.git.rev_parse(sha)
+        sha = repo.hex
         click.echo("Copying odoo with sha to local directory [{}]".format(sha))
         copy_dir_contents(repo_path, odoo_path, exclude=[".git"])
         manifest["odoo_commit"] = sha
@@ -367,7 +393,7 @@ def make_customs(path):
     subprocess.call(["git", "init"], cwd=path)
     subprocess.call(["git", "add", "."], cwd=path)
     subprocess.call(["git", "commit", "-am", "init"], cwd=path)
-    subprocess.call(["gimera", "apply", "--update", "--recursive"], cwd=path)
+    ctx.invoke(gimera, recursive=True, update=True)
     try_to_set_owner(whoami(), path)
 
     click.secho("Initialized - please call following now.", fg="green")
@@ -385,7 +411,7 @@ def get_template_dir():
         subprocess.check_call(["git", "pull"], cwd=path)
     except:
         if path.exists():
-            shutil.rmtree(path)
+            rmtree(None, path)
         subprocess.check_call(["git", "clone", url, path])
     return path
 
@@ -583,93 +609,58 @@ def update_view_in_db(filepath, lineno):
                     )
                     view_type, view_name = cr.fetchone()
 
-                    if view_type == "qweb":
-                        cr.execute(
-                            "select id from ir_ui_view where type ='qweb' and name = %s",
-                            (view_name,),
-                        )
-                        view_ids = set(cr.fetchall())
-
-                    cr.execute(
-                        "update ir_ui_view set {}=%s where id in %s".format(
-                            arch_column
-                        ),
-                        [arch, tuple(view_ids)],
-                    )
-                    cr.connection.commit()
-                    if arch_fs_column:
-                        try:
-                            rel_path = (
-                                module.name
-                                + "/"
-                                + str(filepath.relative_to(module.path))
-                            )
+                    version = current_version()
+                    if version <= 15.0:
+                        if view_type == "qweb":
                             cr.execute(
-                                "update ir_ui_view set arch_fs=%s where id in %s",
-                                [
-                                    rel_path,
-                                    tuple(view_ids),
-                                ],
+                                "select id from ir_ui_view where type ='qweb' and name = %s",
+                                (view_name,),
                             )
-                            cr.connection.commit()
-                        except Exception:
-                            cr.connection.rollback()
+                            view_ids = set(cr.fetchall())
+
+                        cr.execute(
+                            "update ir_ui_view set {}=%s where id in %s".format(
+                                arch_column
+                            ),
+                            [arch, tuple(view_ids)],
+                        )
+                        cr.connection.commit()
+                        if arch_fs_column:
+                            try:
+                                rel_path = (
+                                    module.name
+                                    + "/"
+                                    + str(filepath.relative_to(module.path))
+                                )
+                                cr.execute(
+                                    "update ir_ui_view set arch_fs=%s where id in %s",
+                                    [
+                                        rel_path,
+                                        tuple(view_ids),
+                                    ],
+                                )
+                                cr.connection.commit()
+                            except Exception:
+                                cr.connection.rollback()
 
                     if res:
                         exe("ir.ui.view", "write", view_ids, {"arch_db": arch})
 
 
-class ModulesCache(object):
-    __cache = {}
-
-    @classmethod
-    def _get_cache_file(clazz):
-        _customs_dir = customs_dir()
-        if not is_git_clean(_customs_dir, ignore_files=["requirements.txt"]):
-            return None
-        from gimera import gimera
-
-        if not (_customs_dir / ".git").exists():
-            # case production system no git history for example
-            return None
-        if not gimera._check_all_submodules_initialized():
-            return None
-        hash_git = get_git_hash(_customs_dir)
-        mani_hash = get_hash(MANIFEST_FILE().read_text())
-        hash = get_hash(f"{hash_git}{mani_hash}")
-
-        file = Path(os.path.expanduser(f"~/.local/cache/wodoo/modules/{hash}.v3.bin"))
-        file.parent.mkdir(exist_ok=True, parents=True)
-        try_to_set_owner(whoami(), file.parent.parent)
-        return file
-
-    @classmethod
-    def cache(clazz):
-        if not ModulesCache.__cache:
-            file = clazz._get_cache_file()
-            if not file or not file.exists():
-                data = Modules._get_modules()
-            else:
-                data = pickle.loads(file.read_bytes())
-            if file and not file.exists():
-                file.write_bytes(pickle.dumps(data))
-                try_to_set_owner(whoami(), file)
-            ModulesCache.__cache = data
-
-        return ModulesCache.__cache
-
-    @classmethod
-    def get(clazz, name):
-        return ModulesCache.cache()[name]
-
-
 class Modules(object):
     def __init__(self):
-        self.modules = ModulesCache.cache()
+        pass
+
+    @property
+    def modules(self):
+        if "modules" not in Modules_Cache:
+            modules = self._get_modules()
+            Modules_Cache["modules"] = modules
+        return Modules_Cache["modules"]
 
     @classmethod
-    @measure_time
-    def _get_modules(self):
+    # @profile
+    def _get_modules(self, no_deptree=False):
         modnames = set()
         from .odoo_config import get_odoo_addons_paths
 
@@ -679,7 +670,13 @@ class Modules(object):
             Returns a list of full paths of all manifests
             """
             for path in reversed(get_odoo_addons_paths()):
-                for file in path.glob("*/" + manifest_file_names()):
+                mans = subprocess.check_output(
+                    ["find", ".", "-maxdepth", "2", "-name", manifest_file_names()],
+                    cwd=path,
+                    encoding="utf8",
+                ).splitlines()
+                for file in sorted(mans):
+                    file = path / file
                     modname = file.parent.name
                     if modname in modnames:
                         continue
@@ -688,13 +685,14 @@ class Modules(object):
 
         modules = {}
         all_manifests = get_all_manifests()
-        for m in all_manifests:
+        for m in list(all_manifests):
             module = Module(m)
             module.manifest_dict.get("just read manifest")
             modules[m.parent.name] = module
 
-        for module in modules.values():
-            Modules._get_module_dependency_tree(modules, module)
+        if not no_deptree:
+            for module in sorted(set(modules.values())):
+                self.get_module_flat_dependency_tree(module=module)
 
         # if directory is clear, we may cache
         return modules
@@ -723,7 +721,8 @@ class Modules(object):
             else:
                 modules.append(module.name)
 
-    def get_customs_modules(self, mode=None):
+    # @profile
+    def get_customs_modules(self, mode=None, include_uninstall=False):
         """
         Called by odoo update
 
@@ -735,7 +734,7 @@ class Modules(object):
         """
         assert mode in [None, "to_update", "to_install"]
 
-        modules = get_modules_from_install_file()
+        modules = get_modules_from_install_file(include_uninstall=include_uninstall)
 
         if mode == "to_install":
             modules = [x for x in modules if not DBModules.is_module_installed(x)]
@@ -743,11 +742,8 @@ class Modules(object):
         modules = list(map(lambda x: Module.get_by_name(x), modules))
         return modules
 
-    def get_module_dependency_tree(self, module):
-        return self._get_module_dependency_tree(self.modules, module)
-
     @classmethod
-    def _get_module_dependency_tree(cls, modules, module):
+    def _get_module_dependency_tree(cls, module):
         """
         Dict of dicts
 
@@ -758,41 +754,53 @@ class Modules(object):
             'product': {},
         }
         """
-        result = {}
 
-        def append_deps(mod, data):
-            data[mod.name] = {}
-            for dep in mod.manifest_dict.get("depends", []):
+        def append_deps(mod, depth):
+            result = set()
+            if depth > 1000:
+                raise Exception("Recursive loop perhaps - to depth")
+            if not mod.exists:
+                return set()
+            for dep in list(mod.manifest_dict.get("depends", [])):
                 if dep == "base":
-                    data[mod.name][dep] = {}
+                    if module.name != "base":
+                        result.add(Module.get_by_name("base", no_deptree=True))
                     continue
-                dep_mod = [x for x in modules.values() if x.name == dep]
                 try:
-                    dep_mod = dep_mod[0]
-                except IndexError:
+                    dep_mod = Module.get_by_name(dep, no_deptree=True)
+                except (NotInAddonsPath, Module.IsNot, KeyError):
                     # if it is a module, which is probably just auto install
                     # but not in the manifest, then it is not critical
-                    click.secho(
-                        (
-                            f"Module not found at resolving dependencies: {dep}"
-                            f". Not necessarily a problem at auto install modules."
-                            "\n\n\n"
-                        ),
-                        fg="yellow",
-                        bold=True,
-                    )
-                else:
-                    data[mod.name][dep] = {}
-                    append_deps(dep_mod, data[mod.name][dep])
+                    if dep not in remark_about_missing_module_info:
+                        remark_about_missing_module_info.add(dep)
+                        click.secho(
+                            (
+                                f"Module not found at resolving dependencies: {dep}"
+                                ". Not necessarily a problem at auto install modules."
+                            ),
+                            fg="blue",
+                            bold=False,
+                        )
+                    dep_mod = Module(None, force_name=dep)
+
+                result.add(dep_mod)
+                if dep_mod in dep_tree_cache:
+                    result |= set(dep_tree_cache[dep_mod])
+                    continue
+
+                result |= append_deps(dep_mod, depth + 1)
+
+            dep_tree_cache[mod] = result
+            return result
 
         if module._dep_tree is None:
-            append_deps(module, result)
-            module._dep_tree = result
+            deps = list(sorted(append_deps(module, depth=0)))
+            module._dep_tree = deps
         return module._dep_tree
 
-    def get_all_modules_installed_by_manifest(self):
+    def get_all_modules_installed_by_manifest(self, additional_modules=None):
         all_modules = set()
-        for module in MANIFEST().get("install", []):
+        for module in MANIFEST().get("install", []) + (additional_modules or []):
             all_modules.add(module)
             module = Module.get_by_name(module)
             for module2 in self.get_module_flat_dependency_tree(module):
@@ -805,7 +813,9 @@ class Modules(object):
                 for module2 in self.get_module_flat_dependency_tree(
                     auto_install_module
                 ):
-                    if module2 not in all_modules:
+                    # not sufficient: if depending on auto_install module
+                    # for module2 in auto_install_module.manifest_dict['depends']:
+                    if module2.name not in all_modules:
                         break
                 else:
                     all_modules.add(auto_install_module.name)
@@ -813,23 +823,10 @@ class Modules(object):
                 break
         return list(all_modules)
 
-    @measure_time
+    @classmethod
     def get_module_flat_dependency_tree(self, module):
-        deptree = self.get_module_dependency_tree(module)
-        result = set()
-
-        def x(d):
-            for k, v in d.items():
-                if isinstance(k, str):
-                    result.add(k)
-                else:
-                    result.add(k.name)
-                x(v)
-
-        x(deptree)
-        assert all(isinstance(x, str) for x in result)
-        result = list(map(lambda x: Module.get_by_name(x), list(result)))
-        return sorted(list(result))
+        deps = self._get_module_dependency_tree(module)
+        return sorted(list(deps))
 
     def get_all_auto_install_modules(self):
         auto_install_modules = []
@@ -842,9 +839,17 @@ class Modules(object):
                 auto_install_modules.append(module)
         return list(sorted(set(auto_install_modules)))
 
-    @measure_time
+    # @profile
     def get_filtered_auto_install_modules_based_on_module_list(self, module_list):
-        module_list = list(map(lambda x: Module.get_by_name(x), module_list))
+        def _transform_modulelist(module_list):
+            for mod in module_list:
+                try:
+                    objmod = Module.get_by_name(mod)
+                    yield objmod
+                except NotInAddonsPath:
+                    pass
+
+        module_list = list(_transform_modulelist(module_list))
 
         complete_modules = set()
         for mod in module_list:
@@ -859,6 +864,7 @@ class Modules(object):
                     [
                         x
                         for x in sorted(dependencies)
+                        if x.exists
                         if x.manifest_dict.get("auto_install") or x in complete_modules
                     ]
                 )
@@ -877,13 +883,14 @@ class Modules(object):
                 break
         return list(sorted(set(modules)))
 
-    def get_all_used_modules(self):
+    # @profile
+    def get_all_used_modules(self, include_uninstall=False):
         """
         Returns all modules that are directly or indirectly
         (auto install, depends) installed.
         """
         result = set()
-        modules = self.get_customs_modules()
+        modules = self.get_customs_modules(include_uninstall=True)
         auto_install_modules = (
             self.get_filtered_auto_install_modules_based_on_module_list(modules)
         )
@@ -897,39 +904,33 @@ class Modules(object):
 
         return list(result)
 
-    def get_all_external_dependencies(self, additional_modules=None):
-        additional_modules = additional_modules or []
-        modules = self.get_all_used_modules()
-        modules = list(sorted(set(modules) | set(additional_modules)))
-        pydeps = []
-        deb_deps = []
-        for module in modules:
-            module = Module.get_by_name(module)
+    def get_all_external_dependencies(self, modules):
+        global_data = {"pip": []}
+        for module_name in modules:
+            module = Module.get_by_name(module_name)
+            if module.path is None:
+                raise Exception(f"Module has no path: {module_name}")
             file = module.path / "external_dependencies.txt"
-            new_deps = []
+
+            def extract_deps(data):
+                global_data["pip"].extend(data.get("pip", data.get("python", [])))
+                for k, v in data.items():
+                    if k not in ["pip", "python"]:
+                        global_data.setdefault(k, []).extend(v)
+
             if file.exists():
                 try:
                     content = json.loads(file.read_text())
                 except Exception as e:
-                    click.secho(
-                        "Error parsing json in\n{}:\n{}".format(file, e), fg="red"
-                    )
+                    click.secho("Error parsing json in\n{file}:\n{e}", fg="red")
                     click.secho(file.read_text(), fg="red")
                     sys.exit(1)
-                new_deps = content.get("pip", [])
-                pydeps += new_deps
-                deb_deps += content.get("deb", [])
+                extract_deps(content)
             else:
-                new_deps = module.manifest_dict.get("external_dependencies", {}).get(
-                    "python", []
-                )
-                pydeps += new_deps
+                extract_deps(module.manifest_dict.get("external_dependencies", {}))
 
-            # if new_deps:
-            #    click.secho(f"Adding python dependencies {','.join(new_deps)} from {module.name}", fg='yellow')
-
-        pydeps = self.resolve_pydeps(pydeps)
-        return {"pip": pydeps, "deb": deb_deps}
+        global_data["pip"] = self.resolve_pydeps(set(global_data["pip"]))
+        return global_data
 
     def resolve_pydeps(self, pydeps):
         pydeps = list(set(pydeps))
@@ -938,7 +939,10 @@ class Modules(object):
 
         # keep highest version and or leaveout loosers
         def _map(x):
-            arr = iscompatible.parse_requirements(x)
+            if x:
+                arr = iscompatible.parse_requirements(x)
+            else:
+                arr = []
             for arr in arr:
                 if arr:
                     arr = list(arr)
@@ -948,11 +952,15 @@ class Modules(object):
         parsed_requirements = []
         for inst in pydeps:
             libname = _extract_python_libname(inst)
-            for parsed in [
-                _map(x) for x in pydeps if _extract_python_libname(x) == libname
-            ]:
-                for x in parsed:
-                    parsed_requirements.append((libname, x))
+            if "@" in inst:
+                # concrete url like "pymssql@git+https://github.com/marcwimmer/pymssql"
+                parsed_requirements.append(inst)
+            else:
+                for parsed in [
+                    _map(x) for x in pydeps if _extract_python_libname(x) == libname
+                ]:
+                    for x in parsed:
+                        parsed_requirements.append((libname, x))
         """
         parsed_requirements ilike
         [
@@ -962,7 +970,11 @@ class Modules(object):
         """
 
         allowed = ["==", ">="]
-        unallowed = [x for x in parsed_requirements if x[1][0] not in allowed]
+        unallowed = [
+            x
+            for x in parsed_requirements
+            if not isinstance(x, str) and x[1][0] not in allowed
+        ]
         if unallowed:
             raise Exception(f"Unhandled: {unallowed} - only {allowed} allowed")
 
@@ -1005,6 +1017,16 @@ class Modules(object):
 
 
 class Module(object):
+    assets_template = """
+    <odoo><data>
+    <template id="{id}" inherit_id="{inherit_id}">
+        <xpath expr="." position="inside">
+        </xpath>
+    </template>
+    </data>
+    </odoo>
+    """
+
     class IsNot(Exception):
         pass
 
@@ -1027,32 +1049,70 @@ class Module(object):
             return self.name > other
         return self.name > other.name
 
-    def __init__(self, path):
+    def __eq__(self, other):
+        if isinstance(other, str):
+            return self.name == other
+        return self.name == other.name and self.path == other.path
+
+    def __hash__(self):
+        try:
+            path = self.path
+            name = self.name
+            return hash(f"Module_{path}_{name}")
+        except RecursionError:
+            raise Exception(f"Recursion at {self.name}")
+
+    def __init__(self, path, force_name=None):
         self.version = float(current_version())
         self._manifest_dict = None
-        path = Path(path)
-        remember_cwd = os.getcwd()
-        cwd = Path(os.getcwd())
-        if str(path).startswith("/"):
-            try:
-                path = path.relative_to(cwd)
-            except ValueError:
-                path = path.relative_to(customs_dir())
-                os.chdir(customs_dir())  # reset later; required that parents works
-        p = path if path.is_dir() else path.parent
-
-        for p in [p] + list(p.parents):
-            if (p / manifest_file_names()).exists():
-                if ".git" in p.parts:
-                    continue
-                self._manifest_path = p / manifest_file_names()
-                break
-        if not getattr(self, "_manifest_path", ""):
-            raise Module.IsNot((f"no module found for {path}"))
-        self.name = self._manifest_path.parent.name
-        self.path = self._manifest_path.parent
-        os.chdir(remember_cwd)
+        self._manifest_path = None
         self._dep_tree = None
+        if path:
+            self.__init_path(path, manifest_file_names())
+            self.path = self._manifest_path.parent
+        else:
+            self.path = None
+
+        if force_name:
+            self.name = force_name
+        else:
+            self.name = self._manifest_path.parent.name
+
+    @property
+    def exists(self):
+        return bool(self.path)
+
+    def __init_path(self, path, manifest_filename):
+        path = Path(path)
+        _customs_dir = customs_dir()
+
+        remember_cwd = os.getcwd()
+        try:
+            cwd = Path(remember_cwd)
+            if str(path).startswith("/"):
+                try:
+                    path = path.relative_to(_customs_dir)
+                    os.chdir(_customs_dir)
+                except Exception:
+                    try:
+                        path = path.relative_to(cwd)
+                    except ValueError:
+                        path = path.relative_to(_customs_dir)
+                        os.chdir(
+                            _customs_dir
+                        )  # reset later; required that parents works
+            p = path if path.is_dir() else path.parent
+
+            for p in [p] + list(p.parents):
+                if (p / manifest_filename).exists():
+                    if ".git" in p.parts:
+                        continue
+                    self._manifest_path = p / manifest_filename
+                    break
+            if not getattr(self, "_manifest_path", ""):
+                raise Module.IsNot((f"no module found for {path}"))
+        finally:
+            os.chdir(remember_cwd)
 
     @property
     def manifest_path(self):
@@ -1062,7 +1122,10 @@ class Module(object):
     def manifest_dict(self):
         if not self._manifest_dict:
             try:
-                content = self.manifest_path.read_text()
+                if not self.manifest_path:
+                    abort(f"Could not find manifest path for {self.name}")
+                path = customs_dir() / self.manifest_path
+                content = path.read_text()
                 content = "\n".join(
                     filter(
                         lambda x: not x.strip().startswith("#"), content.splitlines()
@@ -1070,9 +1133,8 @@ class Module(object):
                 )
                 self._manifest_dict = eval(content)  # TODO safe
 
-            except (SyntaxError, Exception):
-                click.secho((f"error at file: {self.manifest_path}"), fg="red")
-                raise
+            except (SyntaxError, Exception) as e:
+                abort(f"error at file: {self.manifest_path}:\n{str(e)}")
         return self._manifest_dict
 
     def __make_path_relative(self, path):
@@ -1100,26 +1162,22 @@ class Module(object):
         return get_directory_hash(self.path)
 
     @classmethod
-    def __get_by_name_cached(cls, name):
+    def __get_by_name_cached(cls, name, nocache=False, no_deptree=False):
         if name not in name_cache:
-            name_cache.setdefault(name, cls._get_by_name(name))
+            name_cache.setdefault(
+                name, cls._get_by_name(name, nocache=nocache, no_deptree=no_deptree)
+            )
         return name_cache[name]
 
     @classmethod
-    def get_by_name(cls, name):
+    def get_by_name(cls, name, nocache=False, no_deptree=False):
         if isinstance(name, Module):
             return name
-        return cls.__get_by_name_cached(name)
+        mod = cls.__get_by_name_cached(name, nocache=nocache, no_deptree=no_deptree)
+        return mod
 
     @classmethod
-    def _get_by_name(cls, name):
-        try:
-            res = ModulesCache.get(name)
-        except IndexError:
-            pass
-        else:
-            return res
-
+    def _get_by_name(cls, name, nocache=False, no_deptree=False):
         from .odoo_config import get_odoo_addons_paths
 
         if isinstance(name, Module):
@@ -1131,6 +1189,13 @@ class Module(object):
                 path = dir
             del dir
         if not path:
+            possible_matches = bashfind('.', name=name, type='d')
+            if possible_matches:
+                click.secho("Found the missing module here:", fg='yellow', bold=True)
+                for dir in possible_matches:
+                    click.secho(dir, fg='yellow')
+                click.secho("Please add it to the manifest addons-paths")
+
             raise NotInAddonsPath(f"Could not get path for {name}")
         if path.exists():
             path = path.resolve()
@@ -1145,8 +1210,11 @@ class Module(object):
         # could be an odoo module then
         for path in get_odoo_addons_paths():
             if (path / name).resolve().is_dir():
-                return Module(path / name)
-        raise Exception("Module not found or not linked: {}".format(name))
+                try:
+                    return Module(path / name)
+                except Module.IsNot:
+                    pass
+        raise KeyError(f"Module not found or not linked: {name}")
 
     @property
     def dependent_modules(self):
@@ -1205,15 +1273,6 @@ class Module(object):
         Put somewhere in the file: assets: <xmlid>, then
         asset is put there.
         """
-        assets_template = """
-    <odoo><data>
-    <template id="{id}" inherit_id="{inherit_id}">
-        <xpath expr="." position="inside">
-        </xpath>
-    </template>
-    </data>
-    </odoo>
-    """
         DEFAULT_ASSETS = "web.assets_backend"
 
         def default_dict():
@@ -1222,16 +1281,12 @@ class Module(object):
                 "js": [],
             }
 
-        files_per_assets = {
-            # 'web.assets_backend': default_dict(),
-            # 'web.report_assets_common': default_dict(),
-            # 'web.assets_frontend': default_dict(),
-        }
+        files_per_assets = {}
         # try to keep assets id
         filepath = self.path / "views/assets.xml"
         current_id = None
         if filepath.exists():
-            with filepath.open("r") as f:
+            with filepath.open("rb") as f:
                 xml = f.read()
                 doc = etree.XML(xml)
                 for t in doc.xpath("//template/@inherit_id"):
@@ -1270,7 +1325,7 @@ class Module(object):
             del local_file_path
             del url
 
-        doc = etree.XML(assets_template)
+        doc = etree.XML(Module.assets_template)
         for asset_inherit_id, _files in files_per_assets.items():
             parent = deepcopy(doc.xpath("//template")[0])
             parent.set("inherit_id", asset_inherit_id)
@@ -1300,26 +1355,34 @@ class Module(object):
         for to_remove in doc.xpath("//template[1] | //template[xpath[not(*)]]"):
             to_remove.getparent().remove(to_remove)
 
-        if current_version() >= 15.0:
+        if current_version() > 14.0:
+            if filepath.exists():
+                filepath.unlink()
             manifest = self.path / "__manifest__.py"
-            yml = eval(manifest.read_text())
-            yml.setdefault("assets", {})
+            jsoncontent = eval(manifest.read_text())
+            jsoncontent.setdefault("assets", {})
+            existing_files = []
+            for asset_file in jsoncontent.get("assets", []):
+                for file in jsoncontent["assets"][asset_file]:
+                    existing_files.append(file)
             for asset_name, files in files_per_assets.items():
-                yml["assets"].setdefault(asset_name, [])
+                jsoncontent["assets"].setdefault(asset_name, [])
                 for files in files.values():
                     for file in files:
-                        if file not in yml["assets"][asset_name]:
-                            yml["assets"][asset_name].append(file)
+                        file = file.lstrip("/")
+                        if file in existing_files:
+                            continue
+                        if file not in jsoncontent["assets"][asset_name]:
+                            jsoncontent["assets"][asset_name].append(file)
                         del file
-            manifest.write_text(str(yml))
+            self.write_manifest(jsoncontent)
         else:
             if not doc.xpath("//link| //script"):
                 if filepath.exists():
                     filepath.unlink()
             else:
                 filepath.parent.mkdir(exist_ok=True)
-                with filepath.open("wb") as f:
-                    f.write(etree.tostring(doc, pretty_print=True))
+                filepath.write_bytes(pretty_xml(etree.tostring(doc, pretty_print=True)))
 
     def get_all_files_of_module(self):
         for file in self.path.glob("**/*"):
@@ -1331,10 +1394,49 @@ class Module(object):
             # relative to module path
             yield file
 
+    def update_init_imports(self):
+        def _remove_all_instruction(content):
+            if "__all__ =" not in content:
+                return content
+            content = content.replace("import os", "")
+            content = content.replace("import glob", "")
+            content = (
+                "\n".join(
+                    filter(lambda x: "__all__ =" not in x, content.splitlines())
+                ).strip()
+                + "\n"
+            )
+            return content
+
+        for path in self.path.glob("*"):
+            if not path.is_dir():
+                continue
+            if path.name not in ["models", "tests", "controller", "controllers"]:
+                continue
+            init_file = path / "__init__.py"
+            if not init_file.exists():
+                continue
+            content = _remove_all_instruction(init_file.read_text()).splitlines()
+
+            for file in path.glob("*"):
+                if file.suffix == ".py" and file.stem not in ["__init__"]:
+                    importinstruction = f"from . import {file.stem}"
+                    if importinstruction not in content:
+                        content += [importinstruction]
+
+            # remove if py does not exist anymore:
+            for line in list(content):
+                if line.startswith("from . import "):
+                    if not (path / (line.split(" ")[-1] + ".py")).exists():
+                        content.remove(line)
+
+            init_file.write_text("\n".join(content))
+
     def update_module_file(self):
-        # updates __openerp__.py the update-section to point to all xml files in the module;
-        # except if there is a directory test; those files are ignored;
+        # updates __openerp__.py the update-section to point to all xml files
+        # in the module; # except if there is a directory test; those files are ignored;
         self.update_assets_file()
+        self.update_init_imports()
         mod = self.manifest_dict
 
         all_files = list(self.get_all_files_of_module())
@@ -1345,32 +1447,40 @@ class Module(object):
 
         mod[DATA_NAME] = []
         mod["demo"] = []
-        if current_version() <= 13.0:
+        mod["qweb"] = []
+        if current_version() < 14.0:
             mod["css"] = []
-            mod["qweb"] = []
         is_web = False
 
         for local_path in all_files:
             if "test" in local_path.parts:
                 continue
             if local_path.suffix in [".xml", ".csv", ".yml"]:
-                if 'demo' in local_path.parts:
+                if "demo" in local_path.parts:
                     mod["demo"].append(str(local_path))
                 elif "static" in local_path.parts:
                     # contains qweb file
                     is_web = True
                     if local_path.suffix == ".xml":
                         if "qweb" in mod:
-                            mod["qweb"].append(str(local_path))
+                            if str(local_path) not in mod["qweb"]:
+                                if current_version() <= 14.0:
+                                    mod["qweb"].append(str(local_path))
+                                else:
+                                    mod["qweb"].append(
+                                        self.name + "/" + str(local_path)
+                                    )
                 else:
-                    mod[DATA_NAME].append(str(local_path))
+                    if local_path.name not in ["gimera.yml"]:
+                        mod[DATA_NAME].append(str(local_path))
             elif local_path.suffix == ".js":
                 pass
             elif local_path.suffix in [".css", ".less", ".scss"]:
                 if "css" in mod:
-                    mod["css"].append(str(local_path))
+                    mod["css"] = list(set(mod["css"] + [str(local_path)]))
 
-        # keep test empty: use concrete call to test-file instead of testing on every module update
+        # keep test empty: use concrete call to test-file instead of testing
+        # on every module update
         mod["test"] = []
 
         # sort
@@ -1379,6 +1489,15 @@ class Module(object):
             mod["css"].sort()
         if "depends" in mod:
             mod["depends"].sort()
+
+        if current_version() > 14.0:
+            if "qweb" in mod:
+                mod.setdefault("assets", {})
+                mod["assets"].setdefault("web.assets_qweb", [])
+                mod["assets"]["web.assets_qweb"] += mod.pop("qweb")
+                mod["assets"]["web.assets_qweb"] = list(
+                    sorted(set(mod["assets"]["web.assets_qweb"]))
+                )
 
         # now sort again by inspecting file content - if __openerp__.sequence NUMBER is found, then
         # set this index; reason: some times there are wizards that reference forms and vice versa
@@ -1410,6 +1529,12 @@ class Module(object):
         sorted_by_index = sorted(sorted_by_index, key=lambda x: x[0])
         mod[DATA_NAME] = [x[1] for x in sorted_by_index]
 
+        # remove assets.xml for newer versions
+        if current_version() > 14.0:
+            mod[DATA_NAME] = list(
+                filter(lambda x: not x.endswith("/assets.xml"), mod[DATA_NAME])
+            )
+
         if is_web:
             mod["web"] = True
         if "application" not in mod:
@@ -1418,10 +1543,78 @@ class Module(object):
         self.write_manifest(mod)
 
     def write_manifest(self, data):
-        with self.manifest_path.open("w") as file:
-            pp = pprint.PrettyPrinter(indent=4, stream=file)
-            pp.pprint(data)
+        from black import format_str, FileMode
+
+        data = str(data)
+        data = format_str(data, mode=FileMode())
+        self.manifest_path.write_text(data)
+
+    def calc_complexity(self):
+        """
+        Calculates the complexity of the module
+        """
+        res = {"loc": 0}
+        for file in self.get_all_files_of_module():
+            if file.suffix in [".py", ".csv", ".xml"]:
+                file = self.path / file
+                res["loc"] += len(file.read_text().splitlines())
+        return res
 
 
 def write_debug_instruction(instruction):
     (customs_dir() / ".debug").write_text(instruction)
+
+
+def _resolve_path_mapping(conn, path, model):
+    """
+    Gets the content of related="..." and returns the final model and field
+    """
+    # last item is field
+    splitted = path.split(".")
+    for i in range(len(splitted) - 1):
+        part = splitted[i]
+        sql = f"select id, model, related, relation from ir_model_fields where name = '{part}' and model='{model}'"
+        fieldrecord = _execute_sql(conn, sql, fetchone=True)
+        if not fieldrecord:
+            raise Exception(f"Could not resolve: {path} on {model}")
+        id, model, related, relation = fieldrecord
+        if related:
+            # hardcore; a field part could point to a related item again
+            model, part = _resolve_path_mapping(conn, related, model)
+        else:
+            model = relation
+
+    return model, splitted[-1]
+
+
+def _determine_affected_modules_for_ir_field_and_related(config, fieldname, modelname):
+    """
+    removes entry from ir.model.fields and also related entries
+    """
+    affected_modules = []
+    # as destructive:
+    assert config.DEVMODE, "Devmode required for this function. May destroy data."
+    conn = config.get_odoo_conn()
+
+    def _get_model_for_field(model, fieldname):
+        name = f"field_{model.replace('.', '_')}__{fieldname}"
+        sql = f"select module from ir_model_data where model='ir.model.fields' and name='{name}'"
+        ir_model_data = _execute_sql(conn, sql, fetchone=True)
+        if ir_model_data:
+            return ir_model_data[0]
+
+    sql = f"select id, model, related from ir_model_fields where related like '%.{fieldname}'"
+    related_fields = _execute_sql(conn, sql, fetchall=True)
+
+    for related_field in related_fields:
+        id, model, path = related_field
+
+        resolved_model, resolved_fieldname = _resolve_path_mapping(conn, path, model)
+        if resolved_model == modelname and resolved_fieldname == fieldname:
+            affected_modules.append(
+                _get_model_for_field(resolved_model, resolved_fieldname)
+            )
+    module_of_field = _get_model_for_field(modelname, fieldname)
+    if module_of_field:
+        affected_modules.append(module_of_field)
+    return affected_modules
