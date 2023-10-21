@@ -41,3 +41,4 @@ repos
 .dev
 /dev/roam.md
 /dev/wsl.py
+dev/

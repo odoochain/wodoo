@@ -24,12 +24,15 @@ Provides functionalities:
 pipx install wodoo
 ```
 
+<<<<<<< HEAD
 ### install directly
 
 ```bash
 pip install git+https://github.com/odoochain/wodoo.git
 pip3 install git+https://gitee.com/odoochain/wodoo.git@odoochain#egg=wodoo
 ```
+=======
+>>>>>>> chain
 
 ### optional: To be not blocked when working on btrfs/zfs volumes and so, this is suggested on dev machines:
 
@@ -52,6 +55,51 @@ odoo -f db reset
 odoo up -d
 
 # now open browser on http://localhost
+```
+
+## How to extend odoo docker image
+
+* make folder ```docker/appendix_odoo``` in your source repo
+* start with a letter before "o" - docker-compose names services in alphabetical order and the appendix container must exist *before* odoo is built
+* add file:
+
+```yaml
+# docker/appendix_odoo/docker-compose.yml
+
+
+# manage-order 1
+services:
+  appendix_odoo:
+    build:
+        context: $CUSTOMS_DIR/docker/appendix_odoo
+        dockerfile: $CUSTOMS_DIR/docker/appendix_odoo/Dockerfile
+```
+* add Docker file:
+
+```docker
+# docker/appendix_odoo/Dockerfile
+FROM ubuntu:22.04
+RUN apt update && \
+apt install -y tar && \
+mkdir /tmp/pack
+
+ADD ibm-iaccess-1.1.0.27-1.0.amd64.deb /tmp/pack
+ADD install.sh /tmp/pack/install.sh
+ADD odbc.ini /tmp/pack/odbc.ini
+
+RUN chmod a+x /tmp/pack/install.sh
+RUN tar cfz /odoo_install_appendix.tar.gz /tmp/pack
+```
+
+# add docker/appendix_odoo/Dockerfile.appendix
+```bash
+COPY --from=${PROJECT_NAME}_appendix_odoo /odoo_install_appendix.tar.gz /tmp/install_appendix.tar.gz
+RUN \
+mkdir /tmp/install_package && \
+cd /tmp/install_package && \
+tar xfz /tmp/install_appendix.tar.gz && \
+ls -lhtra && \
+./install.sh
 ```
 
 ## Store settings in ./odoo of source code
@@ -164,6 +212,30 @@ odoo pgactivity
 |NAMED_ODOO_POSTGRES_VOLUME| Use a specific external volume; not dropped with down -v command|
 |CRONJOB_DADDY_CLEANUP=0 */1 * * * ${JOB_DADDY_CLEANUP}|Turn on grandfather-principle based backup|
 |RESTART_CONTAINERS=1|Sets "restart unless-stopped" policy|
+|ODOO_WORKERS_WEB|Amount of web workers in odoo (default currently 28)|
+
+## Odoo Server Configuration in ~/.odoo/settings/odoo.config and odoo.config.${PROJECT_NAME}
+
+Contents will be appended to [options] section of standard odoo configuration.
+
+Configuration may simple look like:
+
+
+```
+setting1=value1
+```
+
+or like that:
+
+```
+[options]
+setting1=value1
+
+[queue_job]
+settingqj=valueqj
+```
+
+The [options] is prepended automatically if missed.
 
 
 # Pytests
@@ -172,4 +244,11 @@ Best executed with:
 
 ```bash
 time sudo -E pytest
+```
+
+# Performance Check
+
+```python
+pipx runpip wodoo install line_profiler
+~/.local/pipx/venvs/wodoo/bin/python3 -mkernprof -l -v odoo reload
 ```

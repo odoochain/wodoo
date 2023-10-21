@@ -6,6 +6,7 @@ zfs create zfs_pool1/docker/volumes
 set /etc/odoo/settings ZFS_PATH_VOLUMES=zfs_pool1/docker/volumes  then
 
 """
+import os
 import inquirer
 from .tools import abort
 from operator import itemgetter
@@ -38,7 +39,10 @@ systemctl start docker
 
 DOCKER_VOLUMES = Path("/var/lib/docker/volumes")
 
-zfs = search_env_path("zfs")
+try:
+    zfs = search_env_path("zfs")
+except Exception:
+    zfs = None
 
 class NotZFS(Exception):
     def __init__(self, msg, poolname):
@@ -60,7 +64,8 @@ def _get_path(config):
 
 
 def _get_zfs_path(config):
-    if not config.ZFS_PATH_VOLUMES:
+    path = os.getenv("ZFS_PATH_VOLUMES") or config.ZFS_PATH_VOLUMES
+    if not path:
         abort(
             "Please configure the snapshot root folder for docker "
             "snapshots in ZFS_PATH_VOLUMES.\n"
@@ -69,7 +74,7 @@ def _get_zfs_path(config):
             "If poolname is pool1 and mounted on /var/lib/docker you do: \n"
             "zfs create pool1/volumes\n"
         )
-    path = config.ZFS_PATH_VOLUMES + "/" + __get_postgres_volume_name(config)
+    path = path + "/" + __get_postgres_volume_name(config)
     return path
 
 

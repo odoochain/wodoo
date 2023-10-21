@@ -1,6 +1,8 @@
 import click
 import sys
 import subprocess
+from pathlib import Path
+import re
 from .tools import _askcontinue
 from .tools import remove_webassets
 from .cli import cli, pass_config, Commands
@@ -23,6 +25,36 @@ def show_effective_settings(ctx, config):
     config = MyConfigParser(config.files["settings"])
     for k in sorted(config.keys()):
         click.echo("{}={}".format(k, config[k]))
+
+
+@setup.command()
+@pass_config
+@click.pass_context
+def next_port(ctx, config):
+    PORTS = set()
+    if config.PROXY_PORT and str(config.PROXY_PORT) != "80":
+        click.secho(f"Port is already configured: {config.PROXY_PORT}")
+        return
+    # perhaps not reloaded:
+    settings = config.files["project_settings"]
+    content = ""
+    if settings.exists():
+        content = settings.read_text() if settings.exists() else ""
+        if "PROXY_PORT=" in content and "PROXY_PORT=80" not in content:
+            click.secho(f"Already configured: {content}")
+            return
+
+    parentfolder = config.dirs["user_conf_dir"]
+    for file in parentfolder.glob("settings.*"):
+        lines = [
+            x for x in file.read_text().splitlines() if x.startswith("PROXY_PORT=")
+        ]
+        for line in lines:
+            for port in re.findall(r"\d+", line):
+                PORTS.add(int(port))
+    port = max(PORTS) + 1
+    settings.write_text(content + f"\nPROXY_PORT={port}\n")
+    click.secho(f"Configured proxy port: {port}. Please reload and restart machines.")
 
 
 @setup.command(name="remove-web-assets")

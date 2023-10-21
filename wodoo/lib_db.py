@@ -17,6 +17,7 @@ from .tools import exec_file_in_path
 from .cli import cli, pass_config, Commands
 from .lib_clickhelpers import AliasedGroup
 from .tools import __hash_odoo_password
+from .tools import _make_sure_module_is_installed
 
 
 @cli.group(cls=AliasedGroup)
@@ -65,7 +66,8 @@ def pgactivity(config):
     conn = DBConnection(
         config.dbname, config.db_host, config.db_port, config.db_user, config.db_pwd
     )
-    __dcrun(config, 
+    __dcrun(
+        config,
         [
             "pgtools",
             "pg_activity",
@@ -151,15 +153,9 @@ def _psql(
             dbname,
         ]
 
-        # make file permission open for history file
-        histfile = config.files['pgcli_history']
-        if not histfile.exists:
-            histfile.write_text("")
-        os.chmod(histfile, 0o0777)
-        os.chown(histfile, 0, 0)
-
         if use_docker_container or (config.use_docker and config.run_postgres):
-            __dcrun(config, 
+            __dcrun(
+                config,
                 ["pgtools", bin] + cmd,
                 interactive=interactive,
                 env={
@@ -229,15 +225,9 @@ def anonymize(ctx, config):
         click.secho("Either DEVMODE or force required", fg="red")
         sys.exit(-1)
 
-    # Commands.invoke(
-    #     ctx,
-    #     'update',
-    #     module=['anonymize'],
-    #     no_restart=False,
-    #     no_dangling_check=True,
-    #     no_update_module_list=False,
-    #     non_interactive=True,
-    # )
+    _make_sure_module_is_installed(
+        ctx, config, "anonymize", "https://github.com/marcwimmer/odoo-anonymize.git"
+    )
 
     Commands.invoke(
         ctx,
@@ -258,6 +248,10 @@ def cleardb(ctx, config, no_update):
         click.secho("Either DEVMODE or force required", fg="red")
         sys.exit(-1)
 
+    _make_sure_module_is_installed(
+        ctx, config, "cleardb", "https://github.com/marcwimmer/odoo-cleardb.git"
+    )
+
     if not no_update:
         Commands.invoke(
             ctx,
@@ -267,6 +261,7 @@ def cleardb(ctx, config, no_update):
             no_dangling_check=True,
             no_update_module_list=False,
             non_interactive=True,
+            recover_view_error=True,
         )
 
         # update of all modules then required, so that metainformation is

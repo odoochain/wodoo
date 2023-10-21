@@ -19,6 +19,7 @@ import time
 import subprocess
 from os.path import expanduser
 from .consts import VERSIONS
+from .tools import abort
 
 try:
     import psycopg2
@@ -36,7 +37,10 @@ def get_odoo_addons_paths(
     if additional_addons_paths:
         addons_paths += additional_addons_paths
 
-    MUST = ["odoo/odoo/addons", "odoo/addons"]
+    if current_version() <= 9.0:
+        MUST = ["odoo/openerp/addons", "odoo/addons"]
+    else:
+        MUST = ["odoo/odoo/addons", "odoo/addons"]
     for must in reversed(MUST):
         if must in addons_paths:
             continue
@@ -127,11 +131,14 @@ class MANIFEST_CLASS(object):
         self._update(data)
 
     def _update(self, d):
-        d["install"] = list(sorted(d["install"]))
+        d["install"] = list(sorted(set(d["install"])))
         s = json.dumps(d, indent=4)
         tfile = Path(tempfile.mktemp(suffix=".MANIFEST"))
         tfile.write_text(s)
         shutil.move(tfile, MANIFEST_FILE())
+
+        if len(set(d["addons_paths"])) != len(d["addons_paths"]):
+            abort("Addons Paths contains duplicate entries!")
 
     def rewrite(self):
         self._update(self._get_data())
@@ -141,8 +148,13 @@ def MANIFEST():
     return MANIFEST_CLASS()
 
 
+cache_version = {}
+
+
 def current_version():
-    return float(MANIFEST()["version"])
+    if cache_version.get("value") is None:
+        cache_version["value"] = float(MANIFEST()["version"])
+    return cache_version["value"]
 
 
 def get_postgres_connection_params(inside_container=None):

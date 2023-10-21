@@ -143,7 +143,7 @@ def do_kill(ctx, config, machines=[], brutal=False):
         safe_stop = []
         for machine in SAFE_KILL:
             if not machines or machine in machines:
-                if _is_container_running(machine):
+                if _is_container_running(config, machine):
                     safe_stop += [machine]
 
         if safe_stop:
@@ -201,6 +201,9 @@ def down(ctx, config, machines=[], volumes=False, remove_orphans=True):
         options += ["--remove-orphans"]
     __dc(config, ["down"] + options + machines)
 
+    if volumes:
+        Commands.invoke(ctx, "remove-volumes")
+
 
 def stop(ctx, config, machines=[]):
     do_kill(ctx, config, machines=machines)
@@ -253,7 +256,8 @@ def build(ctx, config, machines=[], pull=False, no_cache=False, push=False):
     if config.verbose:
         os.environ["BUILDKIT_PROGRESS"] = "plain"
 
-    __dc(config, 
+    __dc(
+        config,
         ["build"] + options + list(machines),
         env={
             "ODOO_VERSION": config.odoo_version,  # at you developer: do not mismatch with build args
@@ -339,7 +343,6 @@ def shell(config, command="", queuejobs=False):
         "run",
         "--rm",
         "odoo",
-        "python3",
         "/odoolib/shell.py",
     ]
     if queuejobs:
