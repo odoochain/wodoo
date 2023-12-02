@@ -9,7 +9,7 @@ tabulate>=0.8.3
 psycopg2-binary>=2.9.4
 requests>=2.20.1
 lxml>=4.9.2
-docker-compose>=1.29.2
+docker-compose>=1.29.2 ; sys_platform !== 'win32'
 iscompatible
 buttervolume>=3.7
 pudb>=2022.1.3
