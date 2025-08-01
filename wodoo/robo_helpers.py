@@ -44,15 +44,11 @@ import json
 import inquirer
 from pathlib import Path
 import click
-import subprocess
 import shutil
-import tempfile
 import os
-import base64
 import sys
 import arrow
 from .tools import abort
-from .tools import __empty_dir
 
 
 def _normalize_robot_line(line):
@@ -74,13 +70,17 @@ def _get_all_robottest_files(path=None):
             continue
         if "library" in _file.parts:
             continue
+        if _file.name == "test_template.robot":
+            continue
+        if not _file.parts[-1].endswith(".robot"):
+            continue
 
         testfiles.append(_file.relative_to(path))
         del _file
     return testfiles
 
 
-def collect_all(root_dir, robo_file_content):
+def collect_all(root_dir, parent, robo_file_content):
     """collects files in all directories by glob pattern being in a directory with subdir name and copies
     the files to dest_folder
 
@@ -94,11 +94,13 @@ def collect_all(root_dir, robo_file_content):
             line = _normalize_robot_line(line)
             if line.startswith("Resource") and line.endswith(".robot"):
                 filepath = line.split("  ")[1]
-                filepath = root_dir / filepath
+                filepath = Path(filepath.replace("${EXECDIR}", str(root_dir)))
+                if not str(filepath).startswith("/"):
+                    filepath = parent / filepath
                 if not filepath.exists():
                     abort((f"Could not find file {filepath}"))
                 content = filepath.read_text()
-                yield from collect_all(filepath.resolve().parent, content)
+                yield from collect_all(root_dir, filepath.parent, content)
 
     except Exception as ex:  # pylint: disable=broad-except
         abort(str(ex))
@@ -119,7 +121,13 @@ def _get_required_odoo_modules_from_robot_file(filecontent):
         if "odoo-require:" in line:
             line = line.split(":", 1)[1].strip().split(",")
             line = [x.strip() for x in line]
-            yield from line
+            for module in line:
+                yield "install", module
+        if "odoo-uninstall:" in line:
+            line = line.split(":", 1)[1].strip().split(",")
+            line = [x.strip() for x in line]
+            for module in line:
+                yield "uninstall", module
 
 
 def get_odoo_modules(verbose, test_files, root_dir):
@@ -131,11 +139,14 @@ def get_odoo_modules(verbose, test_files, root_dir):
     Returns:
         bytes: the archive in bytes format
     """
+    from .odoo_config import customs_dir
+
+    root_dir = customs_dir()
     test_files = [x.absolute() for x in test_files]
 
     for file in test_files:
         file_content = file.read_text()
-        yield from collect_all(file.parent, file_content)
+        yield from collect_all(root_dir, file.parent, file_content)
 
 
 def _eval_robot_output(
@@ -164,14 +175,18 @@ def _eval_robot_output(
 
         if tabulate:
             click.secho(
-                tabulate(map(data, rows), headers=headers, tablefmt="fancy_grid"), fg=fg
+                tabulate(
+                    map(data, rows), headers=headers, tablefmt="fancy_grid"
+                ),
+                fg=fg,
             )
 
     print_row(list(filter(lambda x: x["all_ok"], test_results)), fg="green")
     print_row(list(filter(lambda x: not x["all_ok"], test_results)), fg="red")
 
     click.secho(
-        (f"Duration: {(arrow.utcnow() - started).total_seconds()}s"), fg=color_info
+        (f"Duration: {(arrow.utcnow() - started).total_seconds()}s"),
+        fg=color_info,
     )
 
     # move completed runs without token to parent to reduce the amount of intermediate files
@@ -197,7 +212,10 @@ def _eval_robot_output(
 
     click.secho(f"Outputs are generated in {find_results_path}", fg="yellow")
     click.secho(
-        ("Watch the logs online at: " f"http://host:{config.PROXY_PORT}/robot-output")
+        (
+            "Watch the logs online at: "
+            f"{config.EXTERNAL_DOMAIN or 'http://localhost'}:{config.PROXY_PORT}/robot-output"
+        )
     )
 
     for line in test_results:
@@ -209,7 +227,8 @@ def _eval_robot_output(
     results_json.write_text(json.dumps(test_results, indent=4))
 
     if failds:
-        sys.exit(-1)
+        return False
+    return True
 
 
 def _select_robot_filename(file, run_all):
@@ -220,8 +239,47 @@ def _select_robot_filename(file, run_all):
         sys.exit(-1)
 
     if file:
+        # test if argument wants to use wildcart matching
+        if "*" in file:
+            wildcart_matches = []
+            for path in Path(".").glob(file):
+                wildcart_matches.append(str(path))
+
+            if len(wildcart_matches) == 0:
+                click.secho(f"No matching files for wildcart {file}", fg="red")
+                sys.exit(-1)
+
+            # only return files that have a match in testfiles
+            # as glob finds all files matching wildcart, not only valid robot test files
+            testset = []
+            for test in testfiles:
+                if str(test) in wildcart_matches:
+                    testset.append(test)
+
+            if len(testset) == 0:
+                click.secho(f"No matching tests for wildcart {file}", fg="red")
+                sys.exit(-1)
+
+            return testset
+
         match = [x for x in map(str, testfiles) if file in x]
         if len(match) > 1:
+            # test if passed file argument is a directory
+            # if so, return all robot test files located inside that folder
+            if os.path.isdir(file):
+                testset = []
+                for test in match:
+                    if test.startswith(file):
+                        testset.append(Path(test))
+
+                if len(testset) == 0:
+                    click.secho(
+                        f"No matching tests in folder {file}", fg="red"
+                    )
+                    sys.exit(-1)
+
+                return testset
+
             if "/" in file:
                 match = [x for x in match if x == file]
             if len(match) > 1:

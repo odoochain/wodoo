@@ -1,14 +1,27 @@
 import json
-from datetime import datetime
-from pathlib import Path
+import arrow
+import time
 
 import click
 from tabulate import tabulate
 
 from .cli import Commands, cli, pass_config
 from .lib_clickhelpers import AliasedGroup
-from .odoo_config import MANIFEST, current_version, customs_dir
 from .tools import _execute_sql
+from .tools import _get_setting
+
+
+def _stringify_translated_dict(v):
+    if isinstance(v, dict):
+        res = []
+        for k, d in v.items():
+            if k != "en_US":
+                continue
+            res.append(d)
+            # res.append(f"{k}: {d}")
+        return ", ".join(res)
+    else:
+        return v
 
 
 @cli.group(cls=AliasedGroup)
@@ -18,27 +31,33 @@ def talk(config):
 
 
 @talk.command()
-@click.argument("name", required=False)
+@click.argument("name", required=False, nargs=-1)
 @click.option("-M", "--module")
 @click.option("-m", "--model")
+@click.option("-r", "--resid")
 @pass_config
-def xmlids(config, name, module, model):
+def xmlids(config, name, module, model, resid):
     conn = config.get_odoo_conn()
     where = " where 1 = 1"
     if model:
         where += f" AND model = '{model}'"
     if module:
         where += f" AND module = '{model}'"
-    if name:
+    if resid:
+        resid = ",".join(
+            map(str, map(lambda x: int(x.strip()), resid.split(",")))
+        )
+        where += f" AND res_id in ({resid})"
+    for name in name:
         where += (
-            f" and (model ilike '%{name}%' or "
+            f" and ( (model ilike '%{name}%' or "
             f"name ilike '%{name}%' or "
-            f"module ilike '%{name}%')"
+            f"module ilike '%{name}%'))"
         )
     rows = _execute_sql(
         conn,
         sql=(
-            "SELECT module||'.'|| name as xmlid, model, res_id from ir_model_data "
+            "SELECT module||'.'|| name as xmlid, model, res_id, noupdate from ir_model_data "
             f"{where} "
             "order by module, name, model "
         ),
@@ -68,6 +87,15 @@ def deactivate_field_in_views(config, field):
 
 @talk.command()
 @click.argument("name", required=True)
+@pass_config
+@click.pass_context
+def get_config_parameter(ctx, config, name):
+    conn = config.get_odoo_conn()
+    click.secho(_get_setting(conn, name))
+
+
+@talk.command()
+@click.argument("name", required=True)
 @click.option("-Q", "--quick", is_flag=True)
 @pass_config
 @click.pass_context
@@ -79,7 +107,10 @@ def set_ribbon(ctx, config, name, quick):
         res = _execute_sql(config.get_odoo_conn(), SQL, fetchone=True)
         if not (res and res[0] == "installed"):
             Commands.invoke(
-                ctx, "update", module=["web_environment_ribbon"], no_dangling_check=True
+                ctx,
+                "update",
+                module=["web_environment_ribbon"],
+                no_dangling_check=True,
             )
 
     _execute_sql(
@@ -122,7 +153,10 @@ def restore_web_icons(ctx, config):
 
 
 @talk.command(
-    help=("If menu items are missing, then recomputing the parent store" "can help")
+    help=(
+        "If menu items are missing, then recomputing the parent store"
+        "can help"
+    )
 )
 @pass_config
 @click.pass_context
@@ -163,36 +197,9 @@ def progress(config):
 @talk.command()
 @pass_config
 def modules_overview(config):
-    from .module_tools import Module, Modules
+    from .lib_src import _modules_overview
 
-    modules = Modules()
-
-    mods = modules.get_all_modules_installed_by_manifest()
-    res = []
-    for mod in mods:
-        mod = Module.get_by_name(mod)
-        manifest = mod.manifest_dict
-        complexity = mod.calc_complexity()
-        manifest = mod.manifest_dict
-
-        combined_description = []
-        for field in ["summary", "description"]:
-            combined_description.append(manifest.get(field, ""))
-        for readme in ["README.md", "README.rst", "README.txt"]:
-            readmefile = mod.path / readme
-            if readmefile.exists():
-                combined_description.append(readmefile.read_text())
-        description = "\n".join(filter(bool, combined_description))
-        data = {
-            "name": mod.name,
-            "path": str(mod.path),
-            "license": manifest.get("license") or "",
-            "version": manifest.get("version"),
-            "lines of code": complexity["loc"],
-            "author": manifest.get("author", ""),
-            "description": description,
-        }
-        res.append(data)
+    res = _modules_overview(config)
     print("===")
     print(json.dumps(res, indent=4))
 
@@ -217,9 +224,9 @@ def menus(config, name):
         _execute_sql(
             conn,
             sql=(
-                f"SELECT id FROM ir_ui_menu WHERE name ILIKE '%{name}%' "
+                f"SELECT id FROM ir_ui_menu WHERE name::text ILIKE '%{name}%' "
                 f" UNION "
-                f"SELECT res_id FROM ir_model_data WHERE model = 'ir.ui.menu' AND name ILIKE '%{name}%'"
+                f"SELECT res_id FROM ir_model_data WHERE model = 'ir.ui.menu' AND name::text ILIKE '%{name}%'"
             ),
             fetchall=True,
             return_columns=False,
@@ -230,7 +237,8 @@ def menus(config, name):
         rows = _execute_sql(
             conn,
             sql=(
-                "SELECT id, name, parent_id FROM ir_ui_menu " f"WHERE id = {parent_id}"
+                "SELECT id, name, parent_id FROM ir_ui_menu "
+                f"WHERE id = {parent_id}"
             ),
             fetchall=True,
             return_columns=False,
@@ -240,10 +248,12 @@ def menus(config, name):
             if row[2]:
                 yield from get_parents(row[2])
 
-    ids = ",".join(map(str, ids))
+    ids = ",".join(map(str, [0] + list(ids)))
     rows = _execute_sql(
         conn,
-        sql=(f"SELECT id, name, parent_id FROM ir_ui_menu WHERE id in (0, {ids})"),
+        sql=(
+            f"SELECT id, name, parent_id FROM ir_ui_menu WHERE id in ({ids})"
+        ),
         fetchall=True,
         return_columns=True,
     )
@@ -251,7 +261,12 @@ def menus(config, name):
     for row in rows[1]:
         xml_id = _get_xml_id(conn, "ir.ui.menu", row[0])
         row = list(row)
-        path = "/".join(map(lambda x: x[1], reversed(list(get_parents(row[0])))))
+        path = "/".join(
+            map(
+                lambda x: _stringify_translated_dict(x[1]),
+                reversed(list(get_parents(row[0]))),
+            )
+        )
         row.insert(0, xml_id)
         row.insert(0, path)
         row = row[:2]
@@ -273,19 +288,21 @@ def groups(config, name):
         _execute_sql(
             conn,
             sql=(
-                f"SELECT id FROM res_groups WHERE name ILIKE '%{name}%' "
+                f"SELECT id FROM res_groups WHERE name::text ILIKE '%{name}%' "
                 f" UNION "
-                f"SELECT res_id FROM ir_model_data WHERE model = 'res.groups' AND name ILIKE '%{name}%'"
+                f"SELECT res_id FROM ir_model_data WHERE model = 'res.groups' AND name::text ILIKE '%{name}%'"
             ),
             fetchall=True,
             return_columns=False,
         ),
     )
 
-    ids = ",".join(map(str, ids))
+    ids = ",".join(map(str, [0] + list(ids)))
     rows = _execute_sql(
         conn,
-        sql=(f"SELECT id, name FROM res_groups WHERE id in (0, {ids}) ORDER BY name"),
+        sql=(
+            f"SELECT id, name FROM res_groups WHERE id in ({ids}) ORDER BY name"
+        ),
         fetchall=True,
         return_columns=True,
     )
@@ -298,7 +315,9 @@ def groups(config, name):
         tablerows.append(row)
     cols = ["XML-ID", "Name"]
     click.secho(
-        tabulate(sorted(tablerows, key=lambda x: x[0]), cols, tablefmt="fancy_grid"),
+        tabulate(
+            sorted(tablerows, key=lambda x: x[0]), cols, tablefmt="fancy_grid"
+        ),
         fg="yellow",
     )
 
@@ -311,7 +330,7 @@ def users(config, login):
     rows = _execute_sql(
         conn,
         sql=(
-            f"SELECT login, name FROM res_users INNER JOIN "
+            f"SELECT res_users.id as user_id, login, name FROM res_users INNER JOIN "
             f"res_partner p on p.id = res_users.partner_id "
             f"WHERE p.name ILIKE '%{login}%' or login ILIKE '%{login}%'"
         ),
@@ -319,7 +338,7 @@ def users(config, login):
         return_columns=False,
     )
 
-    cols = ["login", "name"]
+    cols = ["login", "name", "user_id"]
     click.secho(
         tabulate(rows, cols, tablefmt="fancy_grid"),
         fg="yellow",
@@ -355,6 +374,129 @@ def fields(config, model, field):
     click.secho(
         tabulate(rows, cols, tablefmt="fancy_grid"),
         fg="yellow",
+    )
+
+
+@talk.command()
+@click.option("-i", "--interval", default=5, type=int)
+@pass_config
+def queuejobs(config, interval):
+    conn = config.get_odoo_conn()
+    last_data, last_time = None, None
+    averages = {}
+    while True:
+        rows = _execute_sql(
+            conn,
+            sql=(
+                "SELECT count(*) as count, state "
+                "FROM queue_job "
+                "GROUP BY state "
+                "UNION "
+                "SELECT count(*), 'total' FROM queue_job"
+            ),
+            fetchall=True,
+            return_columns=True,
+        )
+        rows = list(rows)
+        rows[1] = sorted(
+            rows[1], key=lambda x: x[1] == "total" and "zzzzzzzz" or x[1]
+        )
+        data = {x[1]: x[0] for x in rows[1]}
+
+        click.secho(
+            tabulate(rows[1], rows[0], tablefmt="fancy_grid"), fg="yellow"
+        )
+        if last_data:
+            click.secho("Changes: ")
+            now = arrow.get()
+            avg_rows = []
+            for state, v in data.items():
+                diff = data.get(state, 0) - last_data.get(state, 0)
+                seconds = round((now - last_time).total_seconds())
+                if seconds:
+                    diff_per_second = round(abs(diff / seconds), 1)
+                else:
+                    diff_per_second = 0
+                averages.setdefault(state, [])
+                averages[state].append(diff_per_second)
+                avg_diff_per_second = round(
+                    sum(averages[state]) / len(averages[state]), 1
+                )
+            click.secho(
+                tabulate(
+                    avg_rows,
+                    ["state", "items", "items per second"],
+                    tablefmt="fancy_grid",
+                ),
+                fg="blue",
+            )
+            # click.secho(f"{state}: {diff} with {avg_diff_per_second}/s")
+
+        time.sleep(interval)
+        last_data = data
+        last_time = arrow.get()
+
+
+def _get_xmlid(conn, id, model):
+    where = f"model = 'ir.ui.view' and res_id={id}"
+    sql = (
+        "SELECT module||'.'|| name as xmlid, model, res_id from ir_model_data "
+        f"where {where} "
+    )
+    rows = _execute_sql(
+        conn,
+        sql=sql,
+        fetchall=True,
+        return_columns=False,
+    )
+    if rows:
+        return rows[0][0]
+    return None
+
+
+@talk.command()
+@click.option("-M", "--module")
+@click.argument("model", required=True)
+@click.argument("name", required=False)
+@click.option("-t", "--type")
+@pass_config
+def views(config, name, module, model, type):
+    conn = config.get_odoo_conn()
+
+    where = f"model = '{model}'"
+    where += "AND inherit_id is null"
+    rows = _execute_sql(
+        conn,
+        sql=f"select id, name, type from ir_ui_view where {where}",
+        fetchall=True,
+        return_columns=True,
+    )
+
+    rows = list(rows)
+    if type:
+        rows[1] = list(filter(lambda x: x[2] == type, rows[1]))
+
+    rows2 = []
+    for row in rows[1]:
+        row = list(row)
+        row.append(_get_xmlid(conn, row[0], "ir.ui.view"))
+        rows2.append(row)
+    rows[0] = list(rows[0])
+    rows[0].append("xmlid")
+    click.secho(tabulate(rows2, rows[0], tablefmt="fancy_grid"), fg="yellow")
+
+
+@talk.command()
+@pass_config
+@click.pass_context
+def set_remote_keys(ctx, config):
+    Commands.invoke(
+        ctx,
+        "odoo-shell",
+        command=[
+            'env["res.users"].set_remote_keys();',
+            "env.cr.commit()",
+        ],
     )
 
 

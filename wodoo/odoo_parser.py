@@ -1,3 +1,5 @@
+import subprocess
+import click
 from pathlib import Path
 import os
 import re
@@ -44,7 +46,9 @@ def get_view(inherit_id):
     with plaintextfile().open("r") as f:
         lines = f.readlines()
         lines = filter(lambda line: inherit_id in line, lines)
-        lines = filter(lambda line: re.search(rf"\D\ {inherit_id}\ \D", line), lines)
+        lines = filter(
+            lambda line: re.search(rf"\D\ {inherit_id}\ \D", line), lines
+        )
         lines = list(lines)
         if lines:
             return get_file_lineno(lines[0])
@@ -54,13 +58,15 @@ def get_view(inherit_id):
 def get_qweb_template(name):
     with plaintextfile().open("r") as f:
         lines = f.readlines()
-        lines = list(filter(lambda line: "~qweb" in line and name in line, lines))
+        lines = list(
+            filter(lambda line: "~qweb" in line and name in line, lines)
+        )
         if lines:
             return get_file_lineno(lines[0])
     return None, None
 
 
-def walk_files(on_match, pattern):
+def walk_files(on_match, pattern, name):
     from .module_tools import Module, Modules
 
     if modified_filename:
@@ -73,9 +79,13 @@ def walk_files(on_match, pattern):
     else:
         modules = Modules().modules.values()
 
+    files = []
     for mod in modules:
         for file in mod.path.glob("**/" + pattern):
+            files.append((mod, file))
 
+    with click.progressbar(files, label=f"Iterating files for {name}") as bar:
+        for mod, file in bar:
             rel_file = file.relative_to(mod.path)
             if rel_file.parts[0] in [
                 "migrations",
@@ -87,12 +97,13 @@ def walk_files(on_match, pattern):
             if file.name.startswith("."):
                 continue
 
-            lines = file.read_text(encoding="utf-8", errors="ignore").split("\n")
+            lines = file.read_text(encoding="utf-8", errors="ignore").split(
+                "\n"
+            )
             on_match(file, mod, lines)
 
 
 def _get_methods():
-
     result = []
 
     def on_match(filename, module, lines):
@@ -116,7 +127,9 @@ def _get_methods():
                         )
                         model = None
                         if len(linenums) > 0:
-                            model = cache_models[filename]["lines"][linenums[0]]
+                            model = cache_models[filename]["lines"][
+                                linenums[0]
+                            ]
 
                     result.append(
                         {
@@ -130,13 +143,12 @@ def _get_methods():
                         }
                     )
 
-    walk_files(on_match, "*.py")
+    walk_files(on_match, "*.py", "methods")
 
     return result
 
 
 def _get_fields():
-
     result = []
 
     def on_match(filename, module, lines):
@@ -181,13 +193,12 @@ def _get_fields():
                     }
                 )
 
-    walk_files(on_match, "*.py")
+    walk_files(on_match, "*.py", "fields")
 
     return result
 
 
 def _get_views():
-
     result = []
     for id in cache_xml_ids["ids"]:
         e = cache_xml_ids["ids"][id]
@@ -239,7 +250,7 @@ def _get_qweb_templates():
 
                 result.append(r)
 
-    walk_files(on_match, "*.xml")
+    walk_files(on_match, "*.xml", "qweb-templates")
     sorted(result, key=lambda x: x["name"])
 
     return result
@@ -265,7 +276,6 @@ def _get_xml_ids():
         def append_result(
             model, xmlid, line, res_model, name="", ttype="", inherit_id=""
         ):
-
             if "." not in xmlid:
                 xmlid = "%s.%s" % (module.name, xmlid)
 
@@ -294,7 +304,9 @@ def _get_xml_ids():
                 id = r.attrib["id"]
                 model = r.attrib["model"]
 
-                res_model = r.xpath("field[@name='model' or @name='res_model']")
+                res_model = r.xpath(
+                    "field[@name='model' or @name='res_model']"
+                )
                 if len(res_model) > 0:
                     res_model = res_model[0].text
                 else:
@@ -310,7 +322,9 @@ def _get_xml_ids():
                         name = r.xpath("field[@name='name']")[0].text
                     if r.xpath("field[@name='inherit_id']"):
                         if r.xpath("field[@name='inherit_id']/@ref"):
-                            inherit_id = r.xpath("field[@name='inherit_id']/@ref")[0]
+                            inherit_id = r.xpath(
+                                "field[@name='inherit_id']/@ref"
+                            )[0]
                             if "." not in inherit_id:
                                 inherit_id = f"{module}.{inherit_id}"
                     ttype = ""
@@ -379,10 +393,19 @@ def _get_xml_ids():
                 inherit_id = ""
                 if r.get("inherit_id"):
                     inherit_id = r.get("inherit_id")
-                append_result(model, id, r.sourceline, "qweb", inherit_id=inherit_id)
+                append_result(
+                    model, id, r.sourceline, "qweb", inherit_id=inherit_id
+                )
 
-    walk_files(on_match, "*.xml")
+    walk_files(on_match, "*.xml", "xml-ids")
     result.sort(key=lambda x: x["id"])
+
+    for xmlid in result:
+        if "." in xmlid["id"]:
+            name = xmlid["id"]
+        else:
+            name = f"{xmlid['module']}.{xmlid['id']}"
+        xmlid["fullname"] = name
 
     return result
 
@@ -436,7 +459,6 @@ def _get_models():
                     r"class.*\(.*Model.*\)",
                 ]
                 if any(re.match(x, line) for x in osvregex):
-
                     _name = ""
                     _inherit = ""
 
@@ -445,14 +467,18 @@ def _get_models():
                         linenum1 += 1
 
                         if re.search(r"[\\\t\ ]_name.?=", line1):
-                            _name = re.search("[\\'\\\"]([^\\'^\\\"]*)[\\'\\\"]", line1)
+                            _name = re.search(
+                                "[\\'\\\"]([^\\'^\\\"]*)[\\'\\\"]", line1
+                            )
                             if not _name:
                                 # print "classname not found in: %s"%lines[i]
                                 pass
                             else:
                                 _name = _name.group(1)
                         elif re.search(r"[\\\t\ ]_inherit.?=", line1):
-                            match = re.search("[\\'\\\"]([^\\'^\\\"]*)[\\'\\\"]", line1)
+                            match = re.search(
+                                "[\\'\\\"]([^\\'^\\\"]*)[\\'\\\"]", line1
+                            )
                             if match:
                                 _inherit = match.group(1)
                         elif any(re.match(x, line1) for x in osvregex):
@@ -463,7 +489,7 @@ def _get_models():
                     append_model(_name, linenum_class, _inherit, linenum_class)
                     linenum = linenum1 - 1
 
-    walk_files(on_match, "*.py")
+    walk_files(on_match, "*.py", "models")
 
     cache_models.setdefault("models", {})
     for m in cache_models["models"]:
@@ -505,11 +531,12 @@ def update_cache(arg_modified_filename=None):
     """
     param: modified_filename - if given, then only this filename is parsed;
     """
-    from . import module_tools
-    from .module_tools import Module, Modules
+    from .module_tools import Module
 
     if arg_modified_filename:
-        arg_modified_filename = Path(arg_modified_filename).resolve().absolute()
+        arg_modified_filename = (
+            Path(arg_modified_filename).resolve().absolute()
+        )
     plainfile = plaintextfile()
     if not plainfile.is_file():
         arg_modified_filename = None
@@ -553,6 +580,29 @@ def update_cache(arg_modified_filename=None):
         else:
             return
 
+    def write_to_ast(content, ttype, get_name):
+        TEMPLATE = (
+            "{type}\t[{module}]\t{name}\t"
+            + SEP_FILE
+            + "{filepath}"
+            + SEP_LINENO
+            + "{line}"
+        )
+        with click.progressbar(content, label=f"Writing {ttype}...") as bar:
+            for item in bar:
+                f.write(
+                    TEMPLATE.format(
+                        type=ttype,
+                        module=item["module"],
+                        name=get_name(item),
+                        filepath=translate_path_relative_to_customs_root(
+                            item["filepath"]
+                        ),
+                        line=item["line"],
+                    )
+                )
+                f.write("\n")
+
     try:
         TEMPLATE = (
             "{type}\t[{module}]\t{name}\t"
@@ -561,85 +611,33 @@ def update_cache(arg_modified_filename=None):
             + SEP_LINENO
             + "{line}"
         )
-        for model in models:
-            f.write(
-                TEMPLATE.format(
-                    type="model",
-                    module=model["module"],
-                    name=model["model"],
-                    filepath=translate_path_relative_to_customs_root(model["filepath"]),
-                    line=model["line"],
-                )
-            )
-            f.write("\n")
-        for xmlid in xml_ids:
-            if "." in xmlid["id"]:
-                name = xmlid["id"]
-            else:
-                name = f"{xmlid['module']}.{xmlid['id']}"
-            name += " model:" + xmlid["model"]
-            f.write(
-                TEMPLATE.format(
-                    type="xmlid",
-                    module=xmlid["module"],
-                    name=name,
-                    filepath=translate_path_relative_to_customs_root(xmlid["filepath"]),
-                    line=xmlid["line"],
-                )
-            )
-            f.write("\n")
-        for method in methods:
-            name = "{model}.{method}".format(**method)
-            f.write(
-                TEMPLATE.format(
-                    type="def",
-                    module=method["module"],
-                    name=name,
-                    filepath=translate_path_relative_to_customs_root(
-                        method["filepath"]
-                    ),
-                    line=method["line"],
-                )
-            )
-            f.write("\n")
-        for field in fields:
-            name = "{model}.{field}".format(**field)
-            line = TEMPLATE.format(
-                type="field",
-                module=field["module"],
-                name=name,
-                filepath=translate_path_relative_to_customs_root(field["filepath"]),
-                line=field["line"],
-            )
-            f.write(line + "\n")
-        for view in views:
-            name = "{res_model} ~{type} {id} [inherit_id={inherit_id}]".format(**view)
-            f.write(
-                TEMPLATE.format(
-                    type="view",
-                    module=view["module"],
-                    name=name,
-                    filepath=translate_path_relative_to_customs_root(view["filepath"]),
-                    line=view["line"],
-                )
-            )
-            f.write("\n")
-        for qwebtemplate in qwebtemplates:
-            name = "~{type} {id} [inherit_id={inherit_id}]".format(**qwebtemplate)
-            f.write(
-                TEMPLATE.format(
-                    type="qweb",
-                    module=qwebtemplate["module"],
-                    name=name,
-                    filepath=translate_path_relative_to_customs_root(
-                        qwebtemplate["filepath"]
-                    ),
-                    line=qwebtemplate["line"],
-                )
-            )
-            f.write("\n")
+        write_to_ast(models, "model", lambda item: item["model"])
+        write_to_ast(xml_ids, "xmlid", lambda item: item["fullname"])
+        write_to_ast(
+            methods, "method", lambda item: "{model}.{method}".format(**item)
+        )
+        write_to_ast(
+            fields, "field", lambda item: "{model}.{field}".format(**item)
+        )
+        write_to_ast(
+            views,
+            "view",
+            lambda item: "{res_model} ~{type} {id} [inherit_id={inherit_id}]".format(
+                **item
+            ),
+        )
+        write_to_ast(
+            qwebtemplates,
+            "qweb",
+            lambda item: "~{type} {id} [inherit_id={inherit_id}]".format(
+                **item
+            ),
+        )
     finally:
         f.close()
+
+    subprocess.run(f"sort -o '{plainfile}' -u '{plainfile}'", shell=True)
+    subprocess.run(f"awk -i inplace '!seen[$0]++' '{plainfile}'", shell=True)
 
     return plainfile
 
@@ -707,7 +705,9 @@ def try_to_get_context(line_content, lines_before, filename):
         and last_attribute == "ref"
     ):
         return "group"
-    elif "<field " in line_content and re.search("name=['\"]model['\"]", line_content):
+    elif "<field " in line_content and re.search(
+        "name=['\"]model['\"]", line_content
+    ):
         return "model"
     elif "<field " in line_content and re.search(
         "name=['\"]model_id['\"]", line_content

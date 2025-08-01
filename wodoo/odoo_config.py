@@ -1,24 +1,18 @@
 from contextlib import contextmanager
+from collections import Counter
 import shutil
 import tempfile
-from datetime import datetime
 
-from pyparsing import punc8bit
 
 try:
     import arrow
 except Exception:
     arrow = None
 from collections import OrderedDict
-import threading
 from . import click
 import json
 from pathlib import Path
 import os
-import time
-import subprocess
-from os.path import expanduser
-from .consts import VERSIONS
 from .tools import abort
 
 try:
@@ -37,10 +31,12 @@ def get_odoo_addons_paths(
     if additional_addons_paths:
         addons_paths += additional_addons_paths
 
+    odoo_dir = m.odoo_dir
+
     if current_version() <= 9.0:
         MUST = ["odoo/openerp/addons", "odoo/addons"]
     else:
-        MUST = ["odoo/odoo/addons", "odoo/addons"]
+        MUST = [f"{odoo_dir}/odoo/addons", f"{odoo_dir}/addons"]
     for must in reversed(MUST):
         if must in addons_paths:
             continue
@@ -59,7 +55,7 @@ def get_odoo_addons_paths(
 
 
 def customs_dir():
-    env_customs_dir = os.getenv("CUSTOMS_DIR")
+    env_customs_dir = os.getenv("CUSTOMS_DIR") or os.getenv("HOST_CUSTOMS_DIR")
     if not env_customs_dir:
         manifest_file = Path(os.getcwd()) / "MANIFEST"
         if manifest_file.exists():
@@ -116,7 +112,11 @@ class MANIFEST_CLASS(object):
             self["version"] = float(d["version"])
 
     def _get_data(self):
-        return OrderedDict(eval(self.path.read_text() or "{}"))
+        content = self.path.read_text() or "{}"
+        try:
+            return OrderedDict(eval(content))
+        except:
+            abort(f"Could not parse {content}")
 
     def __getitem__(self, key):
         data = self._get_data()
@@ -138,10 +138,21 @@ class MANIFEST_CLASS(object):
         shutil.move(tfile, MANIFEST_FILE())
 
         if len(set(d["addons_paths"])) != len(d["addons_paths"]):
-            abort("Addons Paths contains duplicate entries!")
+            duplicates = [
+                item
+                for item, count in Counter(d["addons_paths"]).items()
+                if count > 1
+            ]
+            abort(f"Addons Paths contains duplicate entries: {duplicates}")
 
     def rewrite(self):
         self._update(self._get_data())
+
+    @property
+    def odoo_dir(self):
+        data = self._get_data()
+        odoo_dir = data.get("odoo_dir", "odoo")
+        return odoo_dir
 
 
 def MANIFEST():
@@ -186,6 +197,7 @@ def get_settings():
         settings_path = Path("/tmp/settings")
         content = ""
         for k, v in os.environ.items():
+            v = v.replace("\n", " ")
             content += f"{k}={v}\n"
         settings_path.write_text(content)
     else:

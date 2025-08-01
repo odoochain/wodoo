@@ -16,7 +16,9 @@ from .tools import _file2env
 from . import module_tools  # NOQA
 from . import odoo_config  # NOQA
 
-SCRIPT_DIRECTORY = Path(inspect.getfile(inspect.currentframe())).absolute().parent
+SCRIPT_DIRECTORY = (
+    Path(inspect.getfile(inspect.currentframe())).absolute().parent
+)
 
 
 os.environ["HOST_HOME"] = os.getenv("HOME", "")
@@ -34,11 +36,15 @@ from . import lib_lang  # NOQA
 from . import lib_module  # NOQA
 from . import lib_setup  # NOQA
 from . import lib_src  # NOQA
+from . import lib_bakery  # NOQA
 from . import lib_docker_registry  # NOQA
 from . import lib_turnintodev  # NOQA
 from . import lib_talk  # NOQA
 from . import lib_linting  # NOQA
+from . import lib_robot  # NOQA
 from . import daddy_cleanup  # NOQA
+from . import lib_bisect  # NOQA
+from . import lib_cached_build  # NOQA
 
 # import container specific commands
 from .tools import abort  # NOQA

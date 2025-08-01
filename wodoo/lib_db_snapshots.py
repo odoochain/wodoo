@@ -2,13 +2,8 @@ import arrow
 import sys
 import click
 import inquirer
-from .tools import remove_webassets
-from .tools import _askcontinue
-from .tools import get_volume_names
 from .cli import cli, pass_config, Commands
 from .lib_clickhelpers import AliasedGroup
-from .tools import __hash_odoo_password
-from .tools import _remove_postgres_connections, _execute_sql
 from .tools import get_filesystem_of_folder
 
 
@@ -45,7 +40,9 @@ def __choose_snapshot(config, take=False):
     if take:
         return take
 
-    answer = inquirer.prompt([inquirer.List("snapshot", "", choices=snapshots_choices)])
+    answer = inquirer.prompt(
+        [inquirer.List("snapshot", "", choices=snapshots_choices)]
+    )
     if not answer:
         sys.exit(0)
     snapshot = answer["snapshot"]
@@ -70,10 +67,9 @@ def do_list(config):
 @pass_config
 @click.pass_context
 def snapshot_make(ctx, config, name):
-
     config.snapshot_manager.assert_environment(config)
     if not name:
-        name = arrow.get().strftime("%Y%m%d")
+        name = arrow.get().strftime("%Y%m%d_%H%M%S")
         click.secho(f"Using {name} as snapshot name")
 
     # remove existing snaps
@@ -87,7 +83,8 @@ def snapshot_make(ctx, config, name):
 @click.pass_context
 def snapshot_restore(ctx, config, name):
     config.snapshot_manager.assert_environment(config)
-    name = __choose_snapshot(config, take=name)
+    if not name:
+        name = __choose_snapshot(config, take=name)
     if not name:
         return
     config.snapshot_manager.restore(config, name)
@@ -112,7 +109,7 @@ def snapshot_remove(ctx, config, name):
 def snapshot_clear_all(ctx, config):
     config.snapshot_manager.assert_environment(config)
 
-    if hasattr(config.snapshot_manager, 'clear_all'):
+    if hasattr(config.snapshot_manager, "clear_all"):
         config.snapshot_manager.clear_all(config)
     else:
         snapshots = config.snapshot_manager.__get_snapshots(config)

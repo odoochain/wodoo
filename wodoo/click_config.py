@@ -19,11 +19,15 @@ class Config(object):
             self.config.force = self.force
 
     def __init__(
-        self, quiet=False, project_name=None, force=False, verbose=False, version=None
+        self,
+        quiet=False,
+        project_name=None,
+        force=False,
+        verbose=False,
+        version=None,
     ):
         from .consts import YAML_VERSION
         from . import odoo_config  # NOQA
-
         from .tools import _get_customs_root
 
         try:
@@ -43,7 +47,8 @@ class Config(object):
         self.files = {}
         self.commands = {}
 
-        self.project_name = project_name
+        if project_name:
+            self.project_name = project_name
 
     def _collect_files(self, files):
         import click
@@ -75,7 +80,7 @@ class Config(object):
     @WORKING_DIR.setter
     def WORKING_DIR(self, value):
         self._WORKING_DIR = value
-        os.environ["CUSTOMS_DIR"] = self._WORKING_DIR
+        os.environ["HOST_CUSTOMS_DIR"] = str(self._WORKING_DIR)
 
     @property
     def project_name(self):
@@ -84,7 +89,11 @@ class Config(object):
     @project_name.setter
     def project_name(self, value):
         self._project_name = value
-        if self._project_name:
+        if os.getenv("DOCKER_HOST_RUN_DIR") and os.getenv("DOCKER_MACHINE") == "1":
+            self.HOST_RUN_DIR = (
+                Path(os.environ["DOCKER_HOST_RUN_DIR"])
+            )
+        elif self._project_name:
             self.HOST_RUN_DIR = (
                 Path(os.environ["HOME"]) / ".odoo" / "run" / self._project_name
             )
@@ -93,7 +102,9 @@ class Config(object):
         os.environ["PROJECT_NAME"] = self._project_name or ""
         os.environ["project_name"] = self._project_name or ""
         self._setup_files_and_folders()
-        os.environ["docker_compose"] = str(self.files.get("docker_compose")) or ""
+        os.environ["docker_compose"] = (
+            str(self.files.get("docker_compose")) or ""
+        )
         self.load_dynamic_modules()
         if self.verbose:
             print(self.files["docker_compose"])
@@ -110,6 +121,15 @@ class Config(object):
 
     def forced(self):
         return Config.Forced(self)
+
+    @property
+    def manifest(self):
+        m = self.WORKING_DIR / "MANIFEST"
+        return eval(m.read_text())
+
+    @property
+    def odoo_version(self):
+        return float(self.manifest['version'])
 
     def __getattribute__(self, name):
         try:
@@ -130,13 +150,20 @@ class Config(object):
                 convert = "asbool"
                 name = name[: -len("_as_bool")]
 
-            for tries in [name, name.lower(), name.upper()]:
+            candidates = [name, name.lower(), name.upper()]
+            for tries in candidates:
                 value = ""
                 if tries not in myconfig.keys():
                     continue
 
                 value = myconfig.get(tries, "")
                 break
+            else:
+                if os.getenv("DOCKER_MACHINE") == "1":
+                    for tries in candidates:
+                        if tries in os.environ:
+                            value = os.environ[tries]
+                            break
 
             if convert:
                 if convert == "asint":
@@ -178,7 +205,7 @@ class Config(object):
 
         from .consts import default_dirs, default_files, default_commands
 
-        for (input, output) in [
+        for input, output in [
             (default_dirs, self.dirs),
             (default_files, self.files),
             (default_commands, self.commands),
@@ -200,6 +227,12 @@ class Config(object):
         def make_absolute(d, key_values={}):
             for k, v in list(d.items()):
                 if not v:
+                    continue
+                if isinstance(v, list):
+                    _d = {k: v[0]}
+                    make_absolute(_d)
+                    v[0] = _d[k]
+                    del _d
                     continue
                 skip = False
                 v = replace_keys(v, key_values)

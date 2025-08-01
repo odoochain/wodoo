@@ -1,7 +1,6 @@
 import click
 import sys
 import subprocess
-from pathlib import Path
 import re
 from .tools import _askcontinue
 from .tools import remove_webassets
@@ -13,17 +12,6 @@ from .lib_clickhelpers import AliasedGroup
 @pass_config
 def setup(config):
     pass
-
-
-@setup.command()
-@pass_config
-@click.pass_context
-def show_effective_settings(ctx, config):
-    from . import MyConfigParser
-
-    config = MyConfigParser(config.files["settings"])
-    for k in sorted(config.keys()):
-        click.echo("{}={}".format(k, config[k]))
 
 
 @setup.command()
@@ -46,14 +34,18 @@ def next_port(ctx, config):
     parentfolder = config.dirs["user_conf_dir"]
     for file in parentfolder.glob("settings.*"):
         lines = [
-            x for x in file.read_text().splitlines() if x.startswith("PROXY_PORT=")
+            x
+            for x in file.read_text().splitlines()
+            if x.startswith("PROXY_PORT=")
         ]
         for line in lines:
             for port in re.findall(r"\d+", line):
                 PORTS.add(int(port))
     port = max(PORTS) + 1
     settings.write_text(content + f"\nPROXY_PORT={port}\n")
-    click.secho(f"Configured proxy port: {port}. Please reload and restart machines.")
+    click.secho(
+        f"Configured proxy port: {port}. Please reload and restart machines."
+    )
 
 
 @setup.command(name="remove-web-assets")
@@ -81,15 +73,27 @@ def status(config):
 
 def _status(config):
     color = "yellow"
+    EXTERNAL_DOMAIN = config.EXTERNAL_DOMAIN
+    if not EXTERNAL_DOMAIN:
+        click.secho(
+            "No external domain configured, please set: EXTERNAL_DOMAIN",
+            fg="red",
+        )
     click.secho("projectname: ", nl=False)
     click.secho(config.project_name, fg=color, bold=True)
     click.secho("version: ", nl=False)
     click.secho(config.odoo_version, fg=color, bold=True)
     click.secho("db: ", nl=False)
-    click.secho(config.dbname, fg=color, bold=True)
+    click.secho(
+        f"{config.dbname}@{config.db_host} (user: {config.db_user})",
+        fg=color,
+        bold=True,
+    )
     if config.PROXY_PORT:
         click.secho("url: ", nl=False)
-        click.secho(f"http://localhost:{config.PROXY_PORT}", fg=color, bold=True)
+        click.secho(
+            f"{EXTERNAL_DOMAIN}:{config.PROXY_PORT}", fg=color, bold=True
+        )
 
     for key in [
         "DEFAULT_DEV_PASSWORD",

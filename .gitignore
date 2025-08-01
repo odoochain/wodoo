@@ -1,3 +1,4 @@
+build
 .watchmanconfig
 data.backup
 config/docker-compose.odoo.yml
@@ -39,3 +40,4 @@ repos
 .vscode
 .idea
 dev/
+/tmp.*

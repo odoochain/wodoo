@@ -1,22 +1,16 @@
 import os
 import traceback
-import click
 import pytest
 import inspect
 import sys
 import shutil
-import tempfile
 from pathlib import Path
 import subprocess
 from click.testing import CliRunner
 from ..lib_composer import do_reload
-from ..lib_composer import config as config_command
-from ..lib_control import build, up, down
+from ..lib_control import build, down
 from ..click_config import Config
-from ..lib_db import reset_db
-from ..lib_module import update, uninstall
-from ..lib_backup import backup_db, restore_db
-from contextlib import contextmanager
+from ..lib_module import update
 
 
 class BaseTestClass:
@@ -26,7 +20,9 @@ class BaseTestClass:
     @property
     def script_dir(self):
         return Path(
-            os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
+            os.path.dirname(
+                os.path.abspath(inspect.getfile(inspect.currentframe()))
+            )
         )
 
     def _write_configuration(self, configuration):
@@ -47,12 +43,18 @@ class BaseTestClass:
 
     @pytest.fixture(scope="function", autouse=True)
     def _setup_odoo(self):
-
         self.project_name = "wodootest"
         os.chdir(self.path)
         shutil.copy(self.script_dir / "gimera.yml", self.path)
         shutil.copy(self.script_dir / "MANIFEST", self.path)
         subprocess.check_call(["git", "init", "."], cwd=self.path)
+        subprocess.check_call(
+            ["git", "config", "init.defaultBranch", "main"], cwd=self.path
+        )
+        subprocess.check_call(["git", "add", "."], cwd=self.path)
+        subprocess.check_call(
+            ["git", "commit", "-m", "empty", "--allow-empty"], cwd=self.path
+        )
         subprocess.check_call(["gimera", "apply"], cwd=self.path)
 
         self.config = Config(force=True, project_name=self.project_name)
@@ -69,7 +71,7 @@ class BaseTestClass:
         except Exception:
             try:
                 self.run(down, ["-v"])
-            except:
+            except Exception:
                 pass
             raise
 

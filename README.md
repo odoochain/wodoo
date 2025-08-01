@@ -48,51 +48,6 @@ odoo up -d
 # now open browser on http://localhost
 ```
 
-## How to extend odoo docker image
-
-* make folder ```docker/appendix_odoo``` in your source repo
-* start with a letter before "o" - docker-compose names services in alphabetical order and the appendix container must exist *before* odoo is built
-* add file:
-
-```yaml
-# docker/appendix_odoo/docker-compose.yml
-
-
-# manage-order 1
-services:
-  appendix_odoo:
-    build:
-        context: $CUSTOMS_DIR/docker/appendix_odoo
-        dockerfile: $CUSTOMS_DIR/docker/appendix_odoo/Dockerfile
-```
-* add Docker file:
-
-```docker
-# docker/appendix_odoo/Dockerfile
-FROM ubuntu:22.04
-RUN apt update && \
-apt install -y tar && \
-mkdir /tmp/pack
-
-ADD ibm-iaccess-1.1.0.27-1.0.amd64.deb /tmp/pack
-ADD install.sh /tmp/pack/install.sh
-ADD odbc.ini /tmp/pack/odbc.ini
-
-RUN chmod a+x /tmp/pack/install.sh
-RUN tar cfz /odoo_install_appendix.tar.gz /tmp/pack
-```
-
-# add docker/appendix_odoo/Dockerfile.appendix
-```bash
-COPY --from=${PROJECT_NAME}_appendix_odoo /odoo_install_appendix.tar.gz /tmp/install_appendix.tar.gz
-RUN \
-mkdir /tmp/install_package && \
-cd /tmp/install_package && \
-tar xfz /tmp/install_appendix.tar.gz && \
-ls -lhtra && \
-./install.sh
-```
-
 ## Store settings in ./odoo of source code
 
 
@@ -203,7 +158,10 @@ odoo pgactivity
 |NAMED_ODOO_POSTGRES_VOLUME| Use a specific external volume; not dropped with down -v command|
 |CRONJOB_DADDY_CLEANUP=0 */1 * * * ${JOB_DADDY_CLEANUP}|Turn on grandfather-principle based backup|
 |RESTART_CONTAINERS=1|Sets "restart unless-stopped" policy|
-|ODOO_WORKERS_WEB|Amount of web workers in odoo (default currently 28)|
+|ODOO_DEBUG_LOGLEVEL=info,error,debug|Loglevel for debug inside odoo container|
+|APT_PROXY_IP=<ip>|Name/IP where to reach the apt-cacher on the host at buildtime from containers|
+|RUN_APT_CACHER|if 1 then host apt cacher|
+|PYPI_HOST||
 
 ## Odoo Server Configuration in ~/.odoo/settings/odoo.config and odoo.config.${PROJECT_NAME}
 
@@ -228,6 +186,71 @@ settingqj=valueqj
 
 The [options] is prepended automatically if missed.
 
+# MANIFEST File
+
+To placed in project root.
+
+The used odoo instance must be placed in /odoo.
+
+```yaml
+{
+    "server-wide-modules": [
+        "web",
+        "field_onchange"
+    ],
+    "python_version": "3.11.10",
+    "version": 17.0,
+    "upgrade_path": [paths to upgrade src of https://github.com/odoo/upgrade-utils],
+    "odoo_dir": "odoo", # default
+    "install": [ ...  ],
+    "uninstall": [
+        "web_tree_many2one_clickable",
+        "helpdesk_create_in_new_tab"
+    ],
+    "devmode_uninstall": [
+        "password_security",
+    ],
+    "tests": [
+        "helpdesk_security",
+        "visitreports"
+    ],
+    "before-odoo-update": [
+      ["update", "make-sure", "stock_delivery"]
+    ],
+    "addons_paths": [
+        "odoo/odoo/addons",
+        "odoo/addons",
+        "enterprise",
+        "addons_tools"
+    ]
+}
+
+
+
+```
+
+# RobotFramework Commands
+
+## Install modules
+
+Put #odoo-require: crm,sale_stock  in a line in your test
+
+## Uninstall modules
+
+Put #odoo-uninstall: partner_autocomplete  in a line in your test
+
+The partner autocomplete nerves for example.
+
+# Append to odoo docker file
+
+* make files like "Dockerfile.appendix" anywhere in your repo
+* to add files, put a directory "Dockerfile.appendix.dir" in the same level; you can
+  access files of it with COPY Dockerfile.appendix.dir/*
+
+# Before Reload Actions
+
+If you develop a strange external repository you can define a pre action scripts,
+that is executed before the reload and you can adapt some things.
 
 # Pytests
 

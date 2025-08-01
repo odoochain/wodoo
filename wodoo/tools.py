@@ -1,3 +1,9 @@
+import platform
+import netifaces
+import passlib
+import csv
+import inspect
+import socket
 import uuid
 import time
 from subprocess import PIPE, STDOUT
@@ -7,18 +13,12 @@ import stat
 from contextlib import contextmanager
 import re
 import inquirer
-import cProfile
-import functools
 
 try:
     import arrow
 except ImportError:
     pass
 from pathlib import Path
-import io
-import traceback
-import json
-import pipes
 import tempfile
 from datetime import datetime
 
@@ -37,11 +37,79 @@ import os
 import subprocess
 import time
 import sys
-from threading import Thread
-from queue import Queue
 import inspect
 from copy import deepcopy
 from passlib.context import CryptContext
+
+try:
+    import xmlrpclib
+except Exception:
+    from xmlrpc import client as xmlrpclib
+
+
+def get_calling_function_variables():
+    # Get the current stack frame
+    current_frame = inspect.currentframe()
+    # Get the frame of the caller (one level up in the stack)
+    caller_frame = current_frame.f_back.f_back
+    # Get the local variables of the caller
+    caller_locals = caller_frame.f_locals
+
+    for k, v in current_frame.f_back.f_back.f_back.f_locals.items():
+        if k not in caller_locals:
+            caller_locals[k] = v
+    for k, v in current_frame.f_back.f_back.f_back.f_back.f_locals.items():
+        if k not in caller_locals:
+            caller_locals[k] = v
+    for (
+        k,
+        v,
+    ) in current_frame.f_back.f_back.f_back.f_back.f_back.f_locals.items():
+        if k not in caller_locals:
+            caller_locals[k] = v
+    return caller_locals
+
+
+def odoorpc(config):
+    PROXY_PORT = config.PROXY_PORT
+    import odoorpc
+
+    if "ODOO_USER" not in os.environ:
+        click.secho(
+            "Tip: set ODOO_USER and ODOO_PASSWORD in your environment",
+            fg="yellow",
+        )
+
+    odoo = odoorpc.ODOO("localhost", port=PROXY_PORT)
+    username = os.getenv("ODOO_USER", "admin")
+    pwd = os.getenv("ODOO_PASSWORD", config.DEFAULT_DEV_PASSWORD or "admin")
+    odoo.login(config.DBNAME, username, pwd)
+    odoo.config["auto_context"] = False  # often context probided by self
+    return odoo
+
+
+def exe(*params, **kwparams):
+    vars = get_calling_function_variables()
+    try:
+        config = vars["config"]
+        PROXY_PORT = config.PROXY_PORT or 8069
+        pwd = config.DEFAULT_DEV_PASSWORD or "admin"
+    except KeyError:
+        PROXY_PORT = 8069
+        pwd = "admin"
+    host = f"http://localhost:{PROXY_PORT}"
+    username = "admin"
+    from .odoo_config import get_settings
+
+    config = get_settings()
+
+    def login(username, password):
+        socket_obj = xmlrpclib.ServerProxy("%s/xmlrpc/common" % (host))
+        return socket_obj.login(config["DBNAME"], username, password)
+
+    uid = login(username, pwd)
+    socket_obj = xmlrpclib.ServerProxy("%s/xmlrpc/object" % (host))
+    return socket_obj.execute(config["DBNAME"], uid, pwd, *params, **kwparams)
 
 
 class DBConnection(object):
@@ -167,6 +235,17 @@ def __get_odoo_commit():
     return commit
 
 
+def table_exists(conn, table):
+    exist = _execute_sql(
+        conn,
+        f"select count(*) from information_schema.tables where table_schema='public' and table_name='{table}'",
+        fetchone=True,
+    )
+    if not exist or not exist[0]:
+        return False
+    return True
+
+
 def _execute_sql(
     connection,
     sql,
@@ -182,7 +261,9 @@ def _execute_sql(
         try:
             if hasattr(connection, "clone"):
                 connection = connection.clone(dbname="postgres")
-            _execute_sql(connection, "SELECT * FROM pg_catalog.pg_tables;", no_try=True)
+            _execute_sql(
+                connection, "SELECT * FROM pg_catalog.pg_tables;", no_try=True
+            )
         except Exception as e:
             click.secho(str(e), fg="red")
 
@@ -217,8 +298,8 @@ def _execute_sql(
         return _call_cr(connection)
 
 
-def _exists_db(conn):
-    sql = f"select count(*) from pg_database where datname='{conn.dbname}'"
+def _exists_db(conn, dbname):
+    sql = f"select count(*) from pg_database where datname='{dbname}'"
     conn = conn.clone()
     conn.dbname = "postgres"
     record = _execute_sql(conn, sql, fetchone=True)
@@ -254,7 +335,9 @@ def docker_list_containers(project_name, service_name, status_filter=None):
     ]
     if status_filter:
         cmd += ["--filter", f"status={status_filter}"]
-    container_ids = subprocess.check_output(cmd, encoding="utf8").strip().splitlines()
+    container_ids = (
+        subprocess.check_output(cmd, encoding="utf8").strip().splitlines()
+    )
     return container_ids
 
 
@@ -279,9 +362,6 @@ def _wait_postgres(config, timeout=600):
             .splitlines()
         )
 
-        import docker
-
-        client = docker.from_env()
         postgres_containers = []
         for container_id in container_ids:
             if not container_id:
@@ -304,7 +384,9 @@ def _wait_postgres(config, timeout=600):
                         )
                     )
 
-                raise Exception(f"Timeout waiting postgres reached: {timeout}seconds")
+                raise Exception(
+                    f"Timeout waiting postgres reached: {timeout}seconds"
+                )
             try:
                 _execute_sql(
                     conn.clone(dbname="postgres"),
@@ -363,7 +445,9 @@ def _is_container_running(config, machine_name):
 def is_up(config, *machine_name):
     assert len(machine_name) == 1
     click.echo(
-        "Running" if _is_container_running(config, machine_name[0]) else "Not Running",
+        "Running"
+        if _is_container_running(config, machine_name[0])
+        else "Not Running",
         machine_name[0],
     )
 
@@ -381,32 +465,35 @@ def _makedirs(path):
     path.mkdir(exist_ok=True, parents=True)
 
 
-def _remove_postgres_connections(connection, sql_afterwards=""):
+def _remove_postgres_connections(connection, dbname, sql_afterwards=""):
     click.echo(f"Removing all current connections from {connection.dbname}")
-    if os.getenv("POSTGRES_DONT_DROP_ACTIVITIES", "") != "1":
-        if _exists_db(connection):
-            SQL = """
-                SELECT pg_terminate_backend(pg_stat_activity.pid)
-                FROM pg_stat_activity
-                WHERE pg_stat_activity.datname = '{}'
-                AND pid <> pg_backend_pid();
-            """.format(
-                connection.dbname, sql_afterwards
+    if os.getenv("POSTGRES_DONT_DROP_ACTIVITIES", "") == "1":
+        click.secho(
+            "It was asked to remove database sessions but POSTGRES_DONT_DROP_ACTIVITIES is set to 1 - so i wont do it"
+        )
+    if _exists_db(connection, dbname):
+        SQL = f"""
+            SELECT pg_terminate_backend(pg_stat_activity.pid)
+            FROM pg_stat_activity
+            WHERE pg_stat_activity.datname = '{dbname}'
+            AND pid <> pg_backend_pid();
+            """
+        _execute_sql(
+            connection.clone(dbname="postgres"), SQL, notransaction=True
+        )
+        if sql_afterwards:
+            _execute_sql(
+                connection.clone(dbname="postgres"),
+                sql_afterwards,
+                notransaction=True,
             )
-            _execute_sql(connection.clone(dbname="postgres"), SQL, notransaction=True)
-            if sql_afterwards:
-                _execute_sql(
-                    connection.clone(dbname="postgres"),
-                    sql_afterwards,
-                    notransaction=True,
-                )
 
 
 def __rename_db_drop_target(conn, from_db, to_db):
     if to_db in ("postgres", "template1"):
         raise Exception("Invalid: {}".format(to_db))
-    _remove_postgres_connections(conn.clone(dbname=from_db))
-    _remove_postgres_connections(conn.clone(dbname=to_db))
+    _remove_postgres_connections(conn, from_db)
+    _remove_postgres_connections(conn, to_db)
     _execute_sql(
         conn.clone(dbname="postgres"),
         (f"drop database if exists {to_db}"),
@@ -417,7 +504,7 @@ def __rename_db_drop_target(conn, from_db, to_db):
         (f"alter database {from_db} rename to {to_db};"),
         notransaction=True,
     )
-    _remove_postgres_connections(conn.clone(dbname=to_db))
+    _remove_postgres_connections(conn, to_db)
 
 
 def _merge_env_dict(env):
@@ -425,7 +512,7 @@ def _merge_env_dict(env):
     for k, v in os.environ.items():
         res[k] = v
     for k, v in env.items():
-        res[k] = v
+        res[k] = str(v)
     return res
 
 
@@ -440,18 +527,20 @@ def _set_default_envs(env):
     return env
 
 
-def __dc(config, cmd, env={}):
+def __dc(config, cmd, env={}, profile="auto"):
     ensure_project_name(config)
-    c = __get_cmd(config) + cmd
+    c = __get_cmd(config, profile=profile) + cmd
     env = _set_default_envs(env)
     return subprocess.check_call(c, env=_merge_env_dict(env))
 
 
-def __dc_out(config, cmd, env={}):
+def __dc_out(config, cmd, env={}, profile="auto"):
     ensure_project_name(config)
-    c = __get_cmd(config) + cmd
+    c = __get_cmd(config, profile=profile) + cmd
     env = _set_default_envs(env)
-    return subprocess.check_output(c, env=_merge_env_dict(env))
+    return subprocess.check_output(
+        c, env=_merge_env_dict(env), encoding="utf8"
+    )
 
 
 def __dcexec(config, cmd, interactive=True, env=None):
@@ -479,6 +568,9 @@ def __dcrun(
     returncode=False,
     pass_stdin=None,
     returnproc=False,
+    detached=False,
+    name=None,
+    write_to_console=None,
 ):
     ensure_project_name(config)
     env = _set_default_envs(env)
@@ -486,6 +578,10 @@ def __dcrun(
     cmd = ["run"]
     if not interactive:
         cmd += ["-T"]
+    if detached:
+        cmd += ["-d"]
+    if name:
+        cmd += ["--name", name]
     cmd += ["--rm"]
     for k, v in env.items():
         cmd += ["-e{}={}".format(k, v)]
@@ -497,6 +593,7 @@ def __dcrun(
         if pass_stdin:
             optional_params["input"] = pass_stdin
             optional_params["universal_newlines"] = True
+            cmd.insert(len(cmd) - 2, "-T")
         else:
             optional_params["stdin"] = sys.stdin
         return subprocess.run(cmd, check=True, **optional_params)
@@ -511,7 +608,10 @@ def __dcrun(
             output = ""
             for line in iter(process.stdout.readline, b""):
                 line = line.decode("utf-8").strip()
-                print(line)
+                if write_to_console is True:
+                    print(line)
+                elif write_to_console:
+                    write_to_console(line)
                 output += line + "\n"
 
             process.communicate()
@@ -583,19 +683,47 @@ def __safeget(array, index, exception_on_missing, file_options=None):
     return array[index]
 
 
-def __get_cmd(config):
-    cmd = config.commands["dc"]
+def get_docker_version():
+    docker = search_env_path("docker")
+    version = subprocess.check_output(
+        [docker, "--version"], encoding="utf8"
+    ).strip()
+    # support for stripping debian specific version suffixes
+    version = re.sub(r"\+dfsg[0-9]*,", "", version)
+    # continue with normal version parsing
+    version = list(map(int, version.split(" ")[2].replace(",", "").split(".")))
+    return version
+
+
+def __get_cmd(config, profile="auto"):
+    if get_docker_version()[0] >= 26:
+        cmd = config.commands["dc2"]
+    else:
+        cmd = config.commands["dc"]
+    if isinstance(profile, str):
+        profile = [profile]
+    for profile in profile or []:
+        cmd += ["--profile", profile]
     cmd = [os.path.expandvars(x) for x in cmd]
     return cmd
 
 
-def __cmd_interactive(config, *params, return_proc=False):
+def __cmd_interactive(config, *params):
     cmd = __get_cmd(config) + list(params)
-    proc = subprocess.Popen(cmd)
-    proc.wait()
-    if return_proc:
-        return proc
-    return proc.returncode
+    tty = sys.stdin.isatty()
+    params = {}
+    if not tty:
+        cmd = [x for x in cmd if x not in ["-it", "--interactive", "--tty"]]
+        params["capture_output"] = True
+        params["text"] = True
+    res = subprocess.run(cmd, **params)
+    if res.returncode:
+        click.secho(
+            f"Command failed with return code: {res.returncode}:\n{cmd}\n\n{res.stdout}\n{res.stderr}",
+            fg="red",
+        )
+    return res.returncode
+
     # ctrl+c leads always to error otherwise
     # if proc.returncode:
     # raise Exception("command failed: {}".format(" ".join(params)))
@@ -671,7 +799,7 @@ def _file2env(filepath, out_dict=None):
 
 
 def _get_bash_for_machine(machine):
-    return "bash"
+    return "sh"
 
 
 def __get_installed_modules(config):
@@ -702,9 +830,25 @@ def __make_file_executable(filepath):
     os.chmod(filepath, st.st_mode | stat.S_IEXEC)
 
 
+def is_docker_available():
+    try:
+        search_env_path("docker")
+    except:
+        return False
+    else:
+        return True
+
+
 def _get_user_primary_group(UID):
     id = search_env_path("id")
-    return subprocess.check_output([id, "-gn", str(UID)], encoding="utf8").strip()
+    return subprocess.check_output(
+        [id, "-gn", str(UID)], encoding="utf8"
+    ).strip()
+
+
+def verbose(txt):
+    if os.getenv("WODOO_VERBOSE") == "1":
+        click.secho(txt, fg="gray")
 
 
 def __try_to_set_owner(UID, path, abort_if_failed=True, verbose=False):
@@ -733,13 +877,18 @@ def __try_to_set_owner(UID, path, abort_if_failed=True, verbose=False):
                     subprocess.check_output(["sudo", "chown", str(UID), line])
                 except Exception as ex:
                     if abort_if_failed:
-                        abort(f"Could not set owner {UID} " f"on path {line}; \n\n{ex}")
+                        abort(
+                            f"Could not set owner {UID} "
+                            f"on path {line}; \n\n{ex}"
+                        )
 
             try:
                 subprocess.check_output(["chgrp", str(primary_group), line])
             except:
                 try:
-                    subprocess.check_output(["sudo", "chgrp", str(primary_group), line])
+                    subprocess.check_output(
+                        ["sudo", "chgrp", str(primary_group), line]
+                    )
                 except:
                     pass
 
@@ -788,7 +937,11 @@ def _get_dump_files(backupdir, fnfilter=None):
 
     rows = []
     for i, file in enumerate(
-        sorted(filter(lambda x: _get_ctime(x), _files), reverse=True, key=_get_ctime)
+        sorted(
+            filter(lambda x: _get_ctime(x), _files),
+            reverse=True,
+            key=_get_ctime,
+        )
     ):
         filepath = backupdir / file
         delta = arrow.get() - arrow.get(filepath.stat().st_mtime)
@@ -804,8 +957,8 @@ def _get_dump_files(backupdir, fnfilter=None):
     return rows
 
 
-def _dropdb(config, conn):
-    if _exists_db(conn):
+def _dropdb(config, conn, dbname):
+    if _exists_db(conn, dbname):
         # TODO ask for name
         if not config.force:
             questions = [
@@ -819,14 +972,14 @@ def _dropdb(config, conn):
                 )
             ]
             answer = inquirer.prompt(questions)
-            if answer["name"] != conn.dbname:
-                abort((f"Dropping aborted - you did not answer: {conn.dbname}"))
+            if answer["name"] != dbname:
+                abort((f"Dropping aborted - you did not answer: {dbname}"))
     else:
-        click.echo("Database does not exist yet: {}".format(conn.dbname))
+        click.echo(f"Database does not exist yet: {dbname}")
     click.echo("Stopping all services and creating new database")
-    _remove_postgres_connections(conn, "drop database {};".format(conn.dbname))
+    _remove_postgres_connections(conn, dbname, f"drop database {dbname};")
 
-    click.echo("Database dropped {}".format(conn.dbname))
+    click.echo(f"Database dropped {dbname}")
 
 
 def remove_webassets(conn):
@@ -862,17 +1015,23 @@ def remove_webassets(conn):
         f"delete from ir_attachment where name ilike '%.assets_%.js' and res_model = 'ir.ui.view'",
     ]
     try:
-        for query in queries:
-            try:
-                click.secho(query, fg="grey")
-                cr.execute(query)
-                conn.commit()
-            except:
-                continue
+        with click.progressbar(
+            queries, label="Executing queries", length=len(queries)
+        ) as bar:
+            for query in queries:
+                try:
+                    bar.update(1, query)
+                    cr.execute(query)
+                    conn.commit()
+                except Exception as ex:
+                    click.secho(str(ex), fg="red")
+                    continue
     finally:
         cr.close()
         conn.close()
-    click.secho("A restart is usually required, when deleting web assets.", fg="green")
+    click.secho(
+        "A restart is usually required, when deleting web assets.", fg="green"
+    )
 
 
 def get_dockercompose():
@@ -884,15 +1043,10 @@ def get_dockercompose():
     return compose
 
 
-def get_volume_names():
-    from . import project_name
-
-    vols = get_dockercompose()["volumes"].keys()
-    return [f"{project_name}_{x}" for x in vols]
-
-
 def __running_as_root_or_sudo():
-    output = subprocess.check_output(["/usr/bin/id", "-u"]).strip().decode("utf-8")
+    output = (
+        subprocess.check_output(["/usr/bin/id", "-u"]).strip().decode("utf-8")
+    )
     return output == "0"
 
 
@@ -929,7 +1083,7 @@ def __remove_tree(dir, retry=3, interval=2):
         raise E
 
 
-def __hash_odoo_password(pwd):
+def _get_crypt_context():
     from .odoo_config import current_version
 
     if current_version() in [
@@ -942,10 +1096,28 @@ def __hash_odoo_password(pwd):
         15.0,
         16.0,
     ]:
-        setpw = CryptContext(schemes=["pbkdf2_sha512", "md5_crypt"])
-        return setpw.encrypt(pwd)
+        return CryptContext(schemes=["pbkdf2_sha512", "md5_crypt"])
+    elif current_version() in [17.0, 18.0]:
+        MIN_ROUNDS = 600_000
+        return CryptContext(
+            schemes=["pbkdf2_sha512", "plaintext"],
+            deprecated=["auto"],
+            pbkdf2_sha512__rounds=max(MIN_ROUNDS, 0),
+        )
     else:
-        raise NotImplementedError()
+        raise NotImplementedError(current_version())
+
+
+def __hash_odoo_password(pwd):
+    return _get_crypt_context().encrypt(pwd)
+
+
+def __verify_password(pwd, hash):
+    try:
+        valid, replacement = _get_crypt_context().verify_and_update(pwd, hash)
+    except passlib.exc.UnknownHashError:
+        return False
+    return valid
 
 
 def abort(msg, nr=1):
@@ -954,13 +1126,24 @@ def abort(msg, nr=1):
 
 
 def sync_folder(dir, dest_dir, excludes=None):
+    import platform
+
+    click.secho(f"Syncing folders {dir} -> {dest_dir}", fg="yellow")
     dir = Path(dir)
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(exist_ok=True, parents=True)
     if not dir or not dest_dir or len(str(dir)) < 5 or len(str(dest_dir)) < 5:
         raise Exception("invalid dirs: {} {}".format(dir, dest_dir))
     if platform.system() in ["Linux", "Darwin"]:
-        cmd = ["rsync", str(dir) + "/", str(dest_dir) + "/", "-r", "--delete-after"]
+        cmd = [
+            "rsync",
+            str(dir) + "/",
+            str(dest_dir) + "/",
+            "--info=progress2",
+            "-r",
+            "-l",
+            "--delete-after",
+        ]
         for exclude in excludes or []:
             cmd += ["--exclude={}".format(exclude)]
         subprocess.check_call(cmd)
@@ -994,6 +1177,7 @@ def copy_dir_contents(dir, dest_dir, exclude=None):
             shutil.copy(str(x.absolute()), str(dest_path))
         else:
             shutil.copytree(str(x.absolute()), str(dest_path))
+    __try_to_set_owner(whoami(), dest_dir, abort_if_failed=False)
 
 
 def _get_host_ip():
@@ -1008,9 +1192,9 @@ def __assure_gitignore(gitignore_file, content):
     if not p.exists():
         p.write_text(content + "\n")
         return
-    exists = [
-        l for l in gitignore_file.read_text().splitlines() if l.strip() == content
-    ]
+    content = str(content).strip()
+    filecontent = gitignore_file.read_text().strip() + "\n"
+    exists = [l for l in filecontent.splitlines() if l.strip() == content]
     if not exists:
         with p.open("a") as f:
             f.write(content)
@@ -1047,7 +1231,9 @@ def measure_time(method):
         ended = datetime.now()
         duration = (ended - started).total_seconds()
         if os.getenv("WODOO_VERBOSE", "") == "1":
-            click.secho((f"Took: {duration} seconds for {method}"), fg="yellow")
+            click.secho(
+                (f"Took: {duration} seconds for {method}"), fg="yellow"
+            )
         return result
 
     return wrapper
@@ -1057,7 +1243,7 @@ def _extract_python_libname(x):
     if "@" in x:
         # return vcs refs
         return x
-    regex = re.compile(r"[\w\-\_]*")
+    regex = re.compile(r"[\w\-\_\.]*")
     x = x.replace("-", "_")
     match = re.findall(regex, x)[0]
     return match
@@ -1078,9 +1264,12 @@ def split_hub_url(config):
             fg="yellow",
         )
         return None
-    username, password = url.split(":", 1)
-    password = password.split("@")[0]
-    url = url.split("@")[1]
+    if "@" in url:
+        username, password = url.split(":", 1)
+        password = password.split("@")[0]
+        url = url.split("@")[1]
+    else:
+        username, password = "", ""
     url, prefix = url.split("/", 1)
     return {
         "url": url,
@@ -1160,15 +1349,24 @@ def get_directory_hash(path):
     click.secho(f"Calculating hash for {path}", fg="yellow")
     # "-N required because absolute path is used"
     remove_pycs(path)
-    hex = (
-        subprocess.check_output(
-            ["dtreetrawl", "-N", "--hash", "-R", path], encoding="utf8"
+    try:
+        hex = (
+            subprocess.check_output(
+                ["dtreetrawl", "-N", "--hash", "-R", path], encoding="utf8"
+            )
+            .strip()
+            .split(" ")[0]
+            .strip()
         )
-        .strip()
-        .split(" ")[0]
-        .strip()
-    )
+    except Exception as ex:
+        if onM1():
+            return ""
+        raise
     return hex
+
+
+def onM1():
+    return platform.machine() == "aarch64"
 
 
 def git_diff_files(path, commit1, commit2):
@@ -1246,7 +1444,9 @@ def _get_version():
     from pathlib import Path
 
     current_dir = Path(
-        os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
+        os.path.dirname(
+            os.path.abspath(inspect.getfile(inspect.currentframe()))
+        )
     )
     version = (current_dir / "version.txt").read_text().strip()
     return version
@@ -1255,7 +1455,9 @@ def _get_version():
 def get_filesystem_of_folder(path):
     df = search_env_path("df")
     lines = (
-        subprocess.check_output([df, "-T", path], encoding="utf8").strip().splitlines()
+        subprocess.check_output([df, "-T", path], encoding="utf8")
+        .strip()
+        .splitlines()
     )
     fstype = list(filter(bool, lines[1].replace("\t", " ").split(" ")))[1]
     return fstype
@@ -1282,11 +1484,32 @@ def is_git_clean(path=None, ignore_files=None):
         .splitlines()
     )
     status = list(
-        filter(lambda x: x.strip().split(" ", 1)[1] not in ignore_files, status)
+        filter(
+            lambda x: x.strip().split(" ", 1)[1] not in ignore_files, status
+        )
     )
     if status:
         click.secho(f"unclean git: {status}")
     return not status
+
+
+def fix_sudo_user_rights(path):
+    if not os.getenv("SUDO_USER"):
+        return
+    subprocess.check_call(
+        [
+            "find",
+            path,
+            "-not",
+            "-user",
+            os.getenv("SUDO_USER"),
+            "-exec",
+            "chown",
+            os.getenv("SUDO_USER"),
+            "{}",
+            ";",
+        ]
+    )
 
 
 def whoami(id=False):
@@ -1302,12 +1525,17 @@ def whoami(id=False):
         return int(os.getenv("SUDO_UID"))
     elif os.getenv("SUDO_UID") and not id:
         return subprocess.check_output(
-            ["/usr/bin/id", "-u", "-n", os.environ["SUDO_UID"]], encoding="utf8"
+            ["/usr/bin/id", "-u", "-n", os.environ["SUDO_UID"]],
+            encoding="utf8",
         ).strip()
     elif id:
-        whoami = subprocess.check_output(["/usr/bin/id", "-u"], encoding="utf8").strip()
+        whoami = subprocess.check_output(
+            ["/usr/bin/id", "-u"], encoding="utf8"
+        ).strip()
         return int(whoami)
-    whoami = subprocess.check_output(["/usr/bin/whoami"], encoding="utf8").strip()
+    whoami = subprocess.check_output(
+        ["/usr/bin/whoami"], encoding="utf8"
+    ).strip()
     return whoami
 
 
@@ -1337,6 +1565,12 @@ def download_file(url):
 def _get_default_project_name(restrict):
     from .exceptions import NoProjectNameException
 
+    if (
+        os.environ.get("project_name")
+        and os.environ.get("DOCKER_MACHINE") == "1"
+    ):
+        return os.environ.get("project_name", None)
+
     def _get_project_name_from_file(path):
         path = Path(path)
         if not path.exists():
@@ -1359,8 +1593,10 @@ def _get_default_project_name(restrict):
     if customs_root:
         root = Path(customs_root)
         if (root / "MANIFEST").exists():
-            return root.name
-    raise NoProjectNameException("No default project name could be determined.")
+            return root.name.replace(".", "_")
+    raise NoProjectNameException(
+        "No default project name could be determined."
+    )
 
 
 def _search_path(filename):
@@ -1406,6 +1642,52 @@ def _shell_complete_file(ctx, param, incomplete):
     return sorted(map(str, files))
 
 
+def _shell_complete_machines(ctx, param, incomplete):
+    project_name = _get_default_project_name(None)
+    dc = _get_default_docker_compose_file()
+    if not project_name or not dc.exists():
+        return []
+    cmd = [
+        "docker",
+        "compose",
+        "-f",
+        str(dc),
+        "ps",
+    ]
+    machines = (
+        subprocess.check_output(cmd, encoding="utf8").strip().splitlines()
+    )
+    machines = list(map(lambda x: x.split(" ")[0], machines))
+    machines = list(map(lambda x: x[len(project_name) + 1 :], machines))
+    if incomplete:
+        machines = list(filter(lambda x: incomplete in x, machines))
+    return machines
+
+
+def _get_default_docker_compose_file():
+    project_name = _get_default_project_name(None)
+    f = Path(
+        os.path.expanduser(f"~/.odoo/run/{project_name}/docker-compose.yml")
+    )
+    return f
+
+
+def _shell_complete_services(ctx, param, incomplete):
+    f = _get_default_docker_compose_file()
+    if not f.exists():
+        return []
+    content = _parse_yaml(__read_file(f))
+    services = content.get("services", {}).keys()
+
+    if incomplete:
+        services = list(
+            filter(
+                lambda x: x.lower().startswith(incomplete.lower()), services
+            )
+        )
+    return list(map(str, services))
+
+
 def ensure_project_name(config):
     if not config.project_name:
         abort("Project name missing.")
@@ -1425,42 +1707,71 @@ def _write_file(file, content):
     return False
 
 
-def _make_sure_module_is_installed(ctx, config, modulename, repo_url):
+def _make_sure_module_is_installed(
+    ctx, config, modulename, repo_url, update=False
+):
     from .module_tools import DBModules
+    from .module_tools import Module
     from .odoo_config import MANIFEST
     from .odoo_config import current_version
-    from .cli import cli, pass_config, Commands
+    from .module_tools import NotInAddonsPath
+    from .cli import Commands
     from gimera.gimera import add as gimera_add
     from gimera.gimera import apply as gimera_apply
 
-    state = DBModules.get_meta_data(modulename)
-    if state["state"] == "installed":
-        return
+    dest_path = Path("addons_wodoo") / modulename
 
-    path = Path("addons_wodoo") / modulename
-    if not path.exists():
-        ctx.invoke(
-            gimera_add,
-            url=repo_url,
-            path=str(path),
-            branch=str(current_version()),
-            type="integrated",
-        )
-        ctx.invoke(gimera_apply, repos=str(path))
-
-    # if not yet there, then pack into "addons_framework"
     manifest = MANIFEST()
-    addons_paths = manifest.get("addons_paths", [])
+    try:
+        Module.get_by_name(modulename)
+    except (KeyError, NotInAddonsPath):
+        path = dest_path
+        if not path.exists():
+            ctx.invoke(
+                gimera_add,
+                url=repo_url,
+                path=str(path),
+                branch=str(current_version()),
+                type="integrated",
+            )
+            ctx.invoke(
+                gimera_apply,
+                repos=[str(path)],
+                no_auto_commit=True,
+                non_interactive=True,
+                no_patches=True,
+            )
+
+            # if not yet there, then pack into "addons_framework"
+            addons_paths = manifest.get("addons_paths", [])
+
+            if str(path) not in addons_paths:
+                addons_paths += [str(path)]
+                manifest["addons_paths"] = addons_paths
+    if update:
+        ctx.invoke(
+            gimera_apply,
+            repos=[str(dest_path)],
+            update=True,
+            no_auto_commit=True,
+            non_interactive=True,
+            no_patches=True,
+        )
     install = manifest.get("install", [])
     if modulename not in install:
         install += [modulename]
     manifest["install"] = install
 
-    if str(path) not in addons_paths:
-        addons_paths += [str(path)]
-        manifest["addons_paths"] = addons_paths
+    addons_path = str(dest_path)
+    addons_paths = manifest["addons_paths"]
+    if addons_path not in addons_paths:
+        addons_paths.append(addons_path)
+    manifest["addons_paths"] = addons_paths
 
     manifest.rewrite()
+    state = DBModules.get_meta_data(modulename)
+    if state and state["state"] == "installed":
+        return
 
     Commands.invoke(
         ctx,
@@ -1473,22 +1784,19 @@ def _make_sure_module_is_installed(ctx, config, modulename, repo_url):
     )
 
 
-def bashfind(path, name=None, wholename=None, type=None):
-    cmd = [
-        "find",
-    ]
+def bashfind(path, name=None, wholename=None, type=None, maxdepth=None):
+    cmd = ["find", path]
     if type:
-        cmd += [
-            "-type",
-            type,
-        ]
+        cmd += ["-type", type]
+    if maxdepth:
+        cmd += ["-maxdepth", str(maxdepth)]
     if wholename:
         cmd += ["-wholename", wholename]
     if name:
         cmd += ["-name", name]
     if not Path(path).exists():
         return []
-    files = subprocess.check_output(cmd, cwd=path, encoding="utf8").splitlines()
+    files = subprocess.check_output(cmd, encoding="utf8").splitlines()
     return list(map(lambda x: Path(path) / x, files))
 
 
@@ -1559,3 +1867,252 @@ def pretty_xml(xmlstring):
             },
         )
         return formatted
+
+
+def __get_postgres_volume_name(config):
+    if config.NAMED_ODOO_POSTGRES_VOLUME:
+        return config.NAMED_ODOO_POSTGRES_VOLUME
+    return f"{config.project_name}_odoo_postgres_volume"
+
+
+def get_volume_fullpath(name):
+    return get_docker_volumes() / name
+
+
+def get_docker_volumes():
+    DOCKER_VOLUMES = Path("/var/lib/docker/volumes")
+    return DOCKER_VOLUMES
+
+
+def get_directory_size(path):
+    size = subprocess.check_output(["du", "-s", path], encoding="utf8")
+    size = size.splitlines()[-1].split()[0]
+    return int(size)
+
+
+def _get_xml_id(config, model, id):
+    conn = config.get_odoo_conn()
+    rows = _execute_sql(
+        conn,
+        f"select module, name from ir_model_data where res_id={id} and model='{model}'",
+        fetchall=True,
+    )
+    if rows:
+        return f"{rows[0][0]}.{rows[0][1]}"
+
+
+def print_prod_env(config):
+    if config.devmode:
+        return
+    click.secho("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", fg="magenta")
+    click.secho("        PRODUCTION ENVIRONMENT      ", fg="magenta")
+    click.secho("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", fg="magenta")
+    time.sleep(2)
+
+
+def force_input_hostname():
+    hostname = socket.gethostname()
+    value = click.prompt(
+        f"Please type the hostname of the machine again [{hostname}]"
+    )
+    if value != hostname:
+        abort(f"You typed {value} but {hostname} was expected.")
+
+
+def start_postgres_if_local(ctx, config):
+    from .cli import Commands
+
+    if config.run_postgres:
+        Commands.invoke(ctx, "up", machines=["postgres"], daemon=True)
+        Commands.invoke(ctx, "wait_for_container_postgres", missing_ok=True)
+
+
+def update_setting(config, name, value):
+    from .myconfigparser import MyConfigParser
+
+    configparser = MyConfigParser(config.files["project_settings"])
+    configparser[name] = value
+    configparser.write()
+
+
+def update_docker_service(config, service_name, service_content):
+    import yaml
+
+    filepath = config.files["project_docker_compose.home.project"]
+    click.secho(f"Writing to {filepath}", fg="yellow")
+    content = __read_file(filepath)
+    compose = yaml.safe_load(content)
+    compose["services"][service_name] = service_content
+    content = yaml.dump(compose, default_flow_style=False)
+    __write_file(filepath, content)
+
+
+def _parse_yaml(content):
+    import yaml
+
+    return yaml.safe_load(content)
+
+
+def _is_db_initialized(cr):
+    return _exists_table(cr, "ir_module_module")
+
+
+def _output_clipboard_csv(rows):
+    fieldnames = rows[0].keys()
+    writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+
+
+def _get_available_robottests(ctx, param, incomplete):
+    from .robo_helpers import _get_all_robottest_files
+    from .odoo_config import customs_dir
+
+    path = customs_dir() or Path(os.getcwd())
+    path = path / (Path(os.getcwd()).relative_to(path))
+    testfiles = list(map(str, _get_all_robottest_files(path))) or []
+    if incomplete:
+        if "/" in incomplete:
+            testfiles = list(
+                filter(lambda x: str(x).startswith(incomplete), testfiles)
+            )
+        else:
+            testfiles = list(filter(lambda x: incomplete in x, testfiles))
+    return sorted(testfiles)
+
+
+def _get_available_modules(ctx, param, incomplete):
+    from .odoo_config import MANIFEST
+
+    try:
+        manifest = MANIFEST()
+        if not manifest:
+            raise Exception("no manifest")
+    except:
+        return []
+    modules = manifest["install"]
+    if incomplete:
+        modules = [x for x in modules if incomplete in x]
+    return sorted(modules)
+
+
+def is_interactive():
+    v = os.getenv("WODOO_INTERACTIVE", "1")
+    return v == "1"
+
+
+def create_network(name="aptcache-net"):
+    # Check if the network already exists
+    result = subprocess.run(
+        [
+            "docker",
+            "network",
+            "ls",
+            "--filter",
+            f"name=^{name}$",
+            "--format",
+            "{{.Name}}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    if name in result.stdout.splitlines():
+        click.secho(f"Network '{name}' already exists.", fg="green")
+        return
+
+    # Create the network
+    click.secho(f"Creating Docker network '{name}'...", fg="yellow")
+    try:
+        subprocess.run(["docker", "network", "create", name], check=True)
+        click.secho(f"Network '{name}' created successfully.", fg="green")
+    except subprocess.CalledProcessError as e:
+        abort(str(e))
+
+
+def remove_comments(content):
+    content = [
+        line.strip()
+        for line in content
+        if line.strip() and not line.startswith("#")
+    ]
+    return content
+
+
+def copy_into_docker(strcontent, container_name, dest_path):
+    with autocleanpaper() as tfile:
+        tfile.write_text(strcontent)
+
+        subprocess.run(
+            [
+                "docker",
+                "cp",
+                tfile,
+                f"{container_name}:{dest_path}",
+            ],
+            check=True,
+        )
+
+
+def docker_get_file_content(container_name, file_path):
+    res = subprocess.run(
+        [
+            "docker",
+            "exec",
+            container_name,
+            "cat",
+            str(file_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    content = res.stdout.strip()
+    content = content.splitlines()
+    return content
+
+
+def get_local_ips():
+    ips = []
+    for iface in netifaces.interfaces():
+        addrs = netifaces.ifaddresses(iface).get(netifaces.AF_INET, [])
+        for addr in addrs:
+            ip = addr.get("addr")
+            if ip and not ip.startswith("127."):
+                ips.append(ip)
+    return ips
+
+
+def choose_ip(ips):
+    import inquirer
+
+    choices = ips + ["Enter manually..."]
+    questions = [
+        inquirer.List(
+            "ip",
+            message="Choose an IP address",
+            choices=choices,
+        )
+    ]
+    answers = inquirer.prompt(questions)
+    if answers["ip"] == "Enter manually...":
+        manual = inquirer.text(message="Enter IP address:")
+        return manual
+    return answers["ip"]
+
+
+def get_arch():
+    return platform.uname().machine  # aarch64
+
+
+def _yamldump(content):
+    import yaml
+
+    class NoAliasDumper(yaml.SafeDumper):
+        def ignore_aliases(self, data):
+            return True
+
+    file_content = yaml.dump(
+        content, default_flow_style=False, sort_keys=False
+    )  # , Dumper=NoAliasDumper)
+    return file_content

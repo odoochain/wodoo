@@ -1,12 +1,9 @@
-from multiprocessing.dummy import Process
 import time
 import re
 import sys
-import uuid
 import arrow
 import threading
 import json
-import base64
 import subprocess
 import inquirer
 import traceback
@@ -16,30 +13,55 @@ import os
 import tempfile
 import click
 
-from wodoo.robo_helpers import _get_required_odoo_modules_from_robot_file
-from .tools import is_git_clean
+from tqdm import tqdm
+from copy import deepcopy
+from .odoo_config import get_conn_autoclose
 from gimera.repo import Repo
+from .tools import __try_to_set_owner
+from .tools import _make_sure_module_is_installed
+from .tools import __assure_gitignore
 from .tools import get_hash
 from .tools import get_directory_hash
+from .tools import is_docker_available
 from .tools import sync_folder
 from .tools import __dcrun
 from .tools import __cmd_interactive
 from .tools import __get_installed_modules
-from .tools import __concurrent_safe_write_file
 from .cli import cli, pass_config, Commands
 from .lib_clickhelpers import AliasedGroup
 from .tools import _execute_sql
 from .tools import get_services
-from .tools import __try_to_set_owner
-from .tools import measure_time, abort
+from .tools import abort
 from .tools import _update_setting
 from .tools import _get_setting
 from .tools import get_git_hash
+from .tools import start_postgres_if_local
+from .tools import _get_available_modules
 from .module_tools import _determine_affected_modules_for_ir_field_and_related
 from pathlib import Path
+from functools import partial
 
 DTF = "%Y-%m-%d %H:%M:%S"
 KEY_SHA_REVISION = "sha.revision"
+
+
+def get_all_modules_installed_by_manifest(config):
+    from .module_tools import Modules
+
+    manifest_modules = Modules().get_all_modules_installed_by_manifest()
+    remove_some_modules(config, manifest_modules)
+    return manifest_modules
+
+
+def remove_some_modules(config, modules):
+    from .odoo_config import MANIFEST
+
+    devmode_uninstall = MANIFEST().get("devmode_uninstall", [])
+    if config.devmode:
+        for mod in devmode_uninstall:
+            if mod in modules:
+                modules.remove(mod)
+            del mod
 
 
 class UpdateException(Exception):
@@ -62,20 +84,20 @@ def odoo_module(config):
 @pass_config
 def abort_upgrade(config):
     click.echo("Aborting upgrade...")
-    SQL = """
-        UPDATE ir_module_module SET state = 'installed' WHERE state = 'to upgrade';
-        UPDATE ir_module_module SET state = 'uninstalled' WHERE state = 'to install';
-    """
-    _execute_sql(config.get_odoo_conn(), SQL)
+    from .module_tools import DBModules
+
+    DBModules.abort_upgrade()
 
 
-def _get_default_modules_to_update():
+def _get_default_modules_to_update(config):
     from .module_tools import Modules, DBModules
 
     mods = Modules()
     module = mods.get_customs_modules("to_update")
     module += DBModules.get_uninstalled_modules_where_others_depend_on()
     module += DBModules.get_outdated_installed_modules(mods)
+    remove_some_modules(config, module)
+
     return module
 
 
@@ -92,10 +114,12 @@ def update_module_file(module):
 @pass_config
 @click.pass_context
 def run_tests(ctx, config):
+    start_postgres_if_local(ctx, config)
     started = datetime.now()
     if not config.devmode and not config.force:
         click.secho(
-            "Devmode required to run unit tests. Database will be destroyed.", fg="red"
+            "Devmode required to run unit tests. Database will be destroyed.",
+            fg="red",
         )
         sys.exit(-1)
 
@@ -115,13 +139,18 @@ def run_tests(ctx, config):
         click.secho("No test files found!")
         return
 
-    if config.force:
-        Commands.invoke(ctx, "wait_for_container_postgres", missing_ok=True)
-        Commands.invoke(ctx, "reset-db")
-        Commands.invoke(ctx, "update", "", tests=False, no_dangling_check=True)
+    def reset_db():
+        if config.force:
+            Commands.invoke(
+                ctx, "wait_for_container_postgres", missing_ok=True
+            )
+            Commands.invoke(ctx, "reset-db")
+            Commands.invoke(
+                ctx, "update", "", tests=False, no_dangling_check=True
+            )
 
+    reset_db()
     from .module_tools import Module
-    from .odoo_config import customs_dir
 
     success, failed = [], []
     for module in tests:
@@ -133,27 +162,59 @@ def run_tests(ctx, config):
         testfiles = [x for x in testfiles if x.name.startswith("test_")]
 
         # identify test files and run them, otherwise tests of dependent modules are run
+        ran_tests = []
         for file in sorted(testfiles):
-            mfpath = module.manifest_path.parent
-            file = mfpath.relative_to(customs_dir()) / file
+            file = module.path / file
+            ran_tests.append(file)
+
+            click.secho(f"So far tests being run:", fg="yellow")
+            for i, txtfile in enumerate(ran_tests, 1):
+                print(f"{i}: {txtfile}")
+
             if config.use_docker:
-                params = ["odoo", "/odoolib/unit_test.py", f"{file}"]
-                click.secho(f"Running test: {file}", fg="yellow", bold=True)
-                res = __dcrun(
-                    config,
-                    params + ["--log-level=error", "--not-interactive"],
-                    returncode=True,
-                )
-                if res:
-                    failed.append(file)
+
+                def run_test(file):
+                    params = ["odoo", "/odoolib/unit_test.py", file]
                     click.secho(
-                        f"Failed, running again with debug on: {file}",
+                        f"Running test: {file}", fg="yellow", bold=True
+                    )
+                    res = __dcrun(
+                        config,
+                        params + ["--log-level=error", "--not-interactive"],
+                        returncode=True,
+                    )
+                    return res
+
+                res = run_test(file)
+                if res:
+                    click.secho(
+                        f"Test {file} failed on first attempt. Resetting db and trying once more.",
                         fg="red",
-                        bold=True,
                     )
-                    res = __cmd_interactive(
-                        config, *(["run", "--rm"] + params + ["--log-level=debug"])
-                    )
+                    reset_db()
+                    res = run_test(file)
+                    if res:
+                        failed.append(file)
+                        click.secho(
+                            f"Failed, running again with debug on: {file}",
+                            fg="red",
+                            bold=True,
+                        )
+                        res = __cmd_interactive(
+                            config,
+                            *(
+                                [
+                                    "run",
+                                    "--rm",
+                                    "odoo",
+                                    "/odoolib/unit_test.py",
+                                    file,
+                                    "--log-level=debug",
+                                ]
+                            ),
+                        )
+                    else:
+                        success.append(file)
                 else:
                     success.append(file)
 
@@ -162,7 +223,11 @@ def run_tests(ctx, config):
 
     # in force-mode shut down
     if config.force:
-        Commands.invoke(ctx, "down", volumes=True)
+        for _ in range(3):
+            try:
+                Commands.invoke(ctx, "down", volumes=True)
+            except:
+                time.sleep(3)
 
     if failed:
         click.secho("Tests failed: ", fg="red")
@@ -250,7 +315,8 @@ def _get_outdated_versioned_modules_of_deptree(modules):
                 version = tuple([int(x) for x in version.split(".")])
             except Exception:
                 click.secho(
-                    f"Broken version name in module {meta_info}: {version}", fg="red"
+                    f"Broken version name in module {meta_info}: {version}",
+                    fg="red",
                 )
                 sys.exit(-1)
             new_version = Module.get_by_name(dep).manifest_dict.get("version")
@@ -263,32 +329,21 @@ def _get_outdated_versioned_modules_of_deptree(modules):
                 assert (
                     len(odoo_version) == 2
                 ), f"Version in manifest should be like 16.0 not '{odoo_version}' as it is in {MANIFEST().path}"
-                new_version = tuple(list(map(int, odoo_version)) + list(new_version))
+                new_version = tuple(
+                    list(map(int, odoo_version)) + list(new_version)
+                )
                 del odoo_version
 
             if new_version > version:
                 # seen: if version in manifest is 14.0.1.0 and installed in
                 # 13.0 odoo then version becomes inside odoo: 13.0.14.0.10
                 # so try to match including current version:
-                odoo_version = list(map(int, str(MANIFEST()['version']).split(".")))
+                odoo_version = list(
+                    map(int, str(MANIFEST()["version"]).split("."))
+                )
                 new_version = tuple(odoo_version + list(new_version))
                 if new_version != version:
                     yield dep
-
-
-def _get_available_modules(ctx, param, incomplete):
-    from .odoo_config import MANIFEST
-
-    try:
-        manifest = MANIFEST()
-        if not manifest:
-            raise Exception("no manifest")
-    except:
-        return []
-    modules = manifest["install"]
-    if incomplete:
-        modules = [x for x in modules if incomplete in x]
-    return sorted(modules)
 
 
 @odoo_module.command(name="UPDATE")
@@ -304,10 +359,14 @@ def _get_available_modules(ctx, param, incomplete):
     is_flag=True,
     help="Can happen if per update fields are removed and views still referencing this field.",
 )
-@click.option("--i18n", default=False, is_flag=True, help="Overwrite Translations")
+@click.option(
+    "--i18n", default=False, is_flag=True, help="Overwrite Translations"
+)
 @pass_config
 @click.pass_context
-def update2(ctx, config, no_dangling_check, non_interactive, recover_view_error, i18n):
+def update2(
+    ctx, config, no_dangling_check, non_interactive, recover_view_error, i18n
+):
     conn = config.get_odoo_conn()
     revision = _get_setting(conn, KEY_SHA_REVISION)
     Commands.invoke(
@@ -320,6 +379,25 @@ def update2(ctx, config, no_dangling_check, non_interactive, recover_view_error,
         recover_view_error=recover_view_error,
         i18n=i18n,
     )
+
+
+@odoo_module.command()
+@click.argument(
+    "module", nargs=-1, required=False, shell_complete=_get_available_modules
+)
+@pass_config
+@click.pass_context
+def make_sure_module_is_installed(ctx, config, module):
+    from .module_tools import DBModules
+
+    if not module:
+        abort("Please provide some modules.")
+    installed_modules = DBModules.get_all_installed_modules()
+    for mod in module:
+        if mod not in installed_modules:
+            ctx.invoke(update, module=[mod])
+        else:
+            click.secho(f"Module '{mod}' already installed.", fg="green")
 
 
 @odoo_module.command()
@@ -367,7 +445,9 @@ def update2(ctx, config, no_dangling_check, non_interactive, recover_view_error,
     help="Not checking for dangling modules",
 )
 @click.option("--tests", default=False, is_flag=True, help="Runs tests")
-@click.option("--i18n", default=False, is_flag=True, help="Overwrite Translations")
+@click.option(
+    "--i18n", default=False, is_flag=True, help="Overwrite Translations"
+)
 @click.option("--no-install-server-wide-first", default=False, is_flag=True)
 @click.option("--no-extra-addons-paths", is_flag=True)
 @click.option(
@@ -377,9 +457,10 @@ def update2(ctx, config, no_dangling_check, non_interactive, recover_view_error,
     help="Specify config file to use, for example config_update",
 )
 @click.option("--server-wide-modules")
-@click.option("--additional-addons-paths")
 @click.option(
-    "--uninstall", is_flag=True, help="Executes just uninstallation of modules."
+    "--uninstall",
+    is_flag=True,
+    help="Executes just uninstallation of modules.",
 )
 @click.option(
     "--test-tags",
@@ -416,6 +497,21 @@ def update2(ctx, config, no_dangling_check, non_interactive, recover_view_error,
     is_flag=False,
     help="Extracts modules changed since this git sha and updates them",
 )
+@click.option(
+    "--stdout",
+    is_flag=False,
+    help="directs stdout to given file",
+)
+@click.option(
+    "--no-scripts",
+    is_flag=True,
+)
+@click.option(
+    "-P",
+    "--no-progress",
+    is_flag=True,
+    help="No progress, but allows interactive debugging",
+)
 @pass_config
 @click.pass_context
 def update(
@@ -438,11 +534,13 @@ def update(
     default_test_tags=False,
     config_file=False,
     server_wide_modules=False,
-    additional_addons_paths=False,
     uninstall=False,
     log=False,
     recover_view_error=False,
     no_outdated_modules=False,
+    stdout=False,
+    no_scripts=False,
+    no_progress=False,
 ):
     """
     Just custom modules are updated, never the base modules (e.g. prohibits adding old stock-locations)
@@ -465,6 +563,10 @@ def update(
 
 
     """
+    started = arrow.get()
+
+    if float(config.odoo_version) < 14.0:
+        no_progress = True
 
     param_module = module
 
@@ -493,15 +595,27 @@ def update(
     """,
         fg="green",
     )
-    from .module_tools import Modules, DBModules, Module
+    from .module_tools import DBModules, Module
     from .odoo_config import MANIFEST
+    from .odoo_config import customs_dir
 
     if test_tags and default_test_tags:
         abort("Conflict: parameter test-tags and default-test-tags")
 
-    if config.run_postgres:
-        Commands.invoke(ctx, "up", machines=["postgres"], daemon=True)
-        Commands.invoke(ctx, "wait_for_container_postgres", missing_ok=True)
+    update_log_file = customs_dir() / "update.log"
+    update_log_file.write_text("")
+    __try_to_set_owner(
+        int(config.owner_uid),
+        update_log_file,
+        verbose=True,
+    )
+    if is_docker_available():
+        start_postgres_if_local(ctx, config)
+    manifest = MANIFEST()
+    if manifest.get("before-odoo-update", []) and not no_scripts:
+        if os.getenv("NO_BEFORE_ODOO_COMMAND") != "1":
+            click.secho("Running before-odoo-update", fg="yellow")
+            _exec_commands(ctx, config, manifest.get("before-odoo-update", []))
 
     def _perform_install(module):
         if since_git_sha and module:
@@ -516,7 +630,7 @@ def update(
             module = _parse_modules(module)
 
         if not module and not since_git_sha:
-            module = _get_default_modules_to_update()
+            module = _get_default_modules_to_update(config)
 
         def _get_outdated_modules():
             return list(
@@ -527,12 +641,16 @@ def update(
             )
 
         if not no_restart:
-            if config.use_docker:
-                Commands.invoke(ctx, "kill", machines=get_services(config, "odoo_base"))
+            if config.use_docker and is_docker_available():
+                Commands.invoke(
+                    ctx, "kill", machines=get_services(config, "odoo_base")
+                )
                 if config.run_redis:
                     Commands.invoke(ctx, "up", machines=["redis"], daemon=True)
                 if config.run_postgres:
-                    Commands.invoke(ctx, "up", machines=["postgres"], daemon=True)
+                    Commands.invoke(
+                        ctx, "up", machines=["postgres"], daemon=True
+                    )
                 Commands.invoke(ctx, "wait_for_container_postgres")
 
         if not no_dangling_check:
@@ -548,7 +666,8 @@ def update(
         def _effective_test_tags():
             if default_test_tags:
                 return ",".join(
-                    f"at_install/{x},post_install{x},standard/{x}" for x in module
+                    f"at_install/{x},post_install{x},standard/{x}"
+                    for x in module
                 )
             else:
                 return test_tags or ""
@@ -560,9 +679,35 @@ def update(
             ).write_text(datetime.now().strftime(DTF))
 
         def _technically_update(modules):
+            if not no_progress:
+                progress = ProgressBarDaemon(interval=0.2)
+                progress.start()
+            output = []
+
+            def _eval_progress(line):
+                def extract_progress(text):
+                    """Extracts module name and progress values from text like 'Loading module documents_project (192/510)'."""
+                    match = re.search(
+                        r"Loading module ([\w_]+) \((\d+)/(\d+)\)", text
+                    )
+                    if match:
+                        module_name, current, total = match.groups()
+                        return module_name, int(current), int(total)
+                    return None, None, None
+
+                module, prog, total = extract_progress(line)
+                if total:
+                    prog = int(prog)
+                    total = int(total)
+                    progress.update_progress(module, prog, total)
+                output.append(line)
+
             try:
                 modules = list(
-                    map(lambda x: x.name if isinstance(x, Module) else x, modules)
+                    map(
+                        lambda x: x.name if isinstance(x, Module) else x,
+                        modules,
+                    )
                 )
                 params = [",".join(modules)]
                 if no_extra_addons_paths:
@@ -583,18 +728,39 @@ def update(
                     params += ["--test-tags=" + _effective_test_tags()]
                 if server_wide_modules:
                     params += ["--server-wide-modules", server_wide_modules]
-                if additional_addons_paths:
-                    params += ["--additional-addons-paths", additional_addons_paths]
+                if manifest.get("upgrade_path", []):
+                    params += [
+                        "--upgrade-path",
+                        ",".join(manifest["upgrade_path"]),
+                    ]
                 if log:
                     params += [f"--log={log}"]
                 params += ["--config-file=" + config_file]
-                rc = list(_exec_update(config, params, non_interactive=non_interactive))
+                rc = list(
+                    _exec_update(
+                        config,
+                        params,
+                        non_interactive=not no_progress,  # because of progressbar; non_interactive if not stdout else True,
+                        write_to_console=_eval_progress
+                        if not no_progress
+                        else None,
+                        # write_to_console=lambda line: progress.write(line),
+                    )
+                )
                 if len(rc) == 1:
                     rc = rc[0]
                 else:
                     rc, output = rc
 
+                if stdout:
+                    Path(stdout).write_text(output)
+
+                if not no_progress:
+                    update_log_file.write_text("".join(output))
+
                 if rc:
+                    if not no_progress:
+                        click.secho(update_log_file.read_text())
                     if recover_view_error:
                         try:
                             _try_to_recover_view_error(config, output)
@@ -603,7 +769,9 @@ def update(
                         except Exception as ex:
                             raise UpdateException(module) from ex
                         else:
-                            raise Exception(f"Error at update - please check logs")
+                            raise Exception(
+                                f"Error at update - please check logs"
+                            )
                     else:
                         raise UpdateException(module)
 
@@ -613,10 +781,18 @@ def update(
                 raise
             except Exception as ex:
                 click.echo(traceback.format_exc())
-                ctx.invoke(show_install_state, suppress_error=no_dangling_check)
+                ctx.invoke(
+                    show_install_state, suppress_error=no_dangling_check
+                )
                 raise Exception(
-                    ("Error at /update_modules.py - " "aborting update process.")
+                    (
+                        "Error at /update_modules.py - "
+                        "aborting update process."
+                    )
                 ) from ex
+            finally:
+                if not no_progress:
+                    progress.stop()
 
         trycount = 0
         max_try_count = 5
@@ -639,7 +815,7 @@ def update(
             else:
                 break
 
-        if not no_restart and config.use_docker:
+        if not no_restart and config.use_docker and os.getenv("DOCKER_MACHINE") != "1":
             Commands.invoke(ctx, "restart", machines=["odoo"])
             if config.run_odoocronjobs:
                 Commands.invoke(ctx, "restart", machines=["odoo_cronjobs"])
@@ -656,6 +832,8 @@ def update(
     if not uninstall:
         _perform_install(module)
 
+    _uninstall_devmode_modules(ctx, config, manifest)
+
     all_modules = (
         not param_module
         or len(param_module) == 1
@@ -663,16 +841,50 @@ def update(
     )
 
     if uninstall or all_modules:
-        _uninstall_marked_modules(config, MANIFEST().get("uninstall", []))
+        _uninstall_marked_modules(
+            ctx, config, manifest.get("uninstall", []), no_restart
+        )
 
     # check danglings
     if not no_dangling_check and all_modules:
         ctx.invoke(show_install_state, suppress_error=False)
 
     if check_install_state:
-        _do_check_install_state(ctx, config, module, all_modules, no_dangling_check)
+        _do_check_install_state(
+            ctx, config, module, all_modules, no_dangling_check
+        )
 
     _set_sha(config)
+
+    duration = (arrow.get() - started).total_seconds()
+    date = arrow.get().strftime("%Y-%m-%d %H:%M:%S")
+    click.secho(f"Update done at {date} - duration {duration}s", fg="yellow")
+    if not no_progress:
+        click.secho("Update-log here: ./update.log")
+        __assure_gitignore(
+            customs_dir() / ".gitignore",
+            update_log_file.relative_to(customs_dir()),
+        )
+
+
+def _exec_commands(ctx, config, commands):
+    for command in commands:
+        cmd = (
+            [sys.executable, sys.argv[0]]
+            + ["-p", config.PROJECT_NAME]
+            + command
+        )
+        env = deepcopy(os.environ)
+        env["NO_BEFORE_ODOO_COMMAND"] = "1"
+        subprocess.run(cmd, check=True, env=env)
+
+
+def _uninstall_devmode_modules(ctx, config, manifest):
+    if config.devmode and manifest.get("devmode_uninstall", []):
+        for mod in manifest["devmode_uninstall"]:
+            _uninstall_marked_modules(
+                ctx, config, manifest["devmode_uninstall"], False
+            )
 
 
 def _set_sha(config):
@@ -709,17 +921,21 @@ def _try_to_recover_view_error(config, output):
     lines = output.splitlines()
 
     for i, line in enumerate(lines):
-        match = re.findall('Field "([^"]*?)" does not exist in model "([^"]*?)"', line)
+        match = re.findall(
+            'Field "([^"]*?)" does not exist in model "([^"]*?)"', line
+        )
         if match:
             field, model = match[0]
-            affected_modules = _determine_affected_modules_for_ir_field_and_related(
-                config, field, model
+            affected_modules = (
+                _determine_affected_modules_for_ir_field_and_related(
+                    config, field, model
+                )
             )
             raise RepeatUpdate(affected_modules)
 
 
 def show_dangling():
-    from .module_tools import Modules, DBModules, Module
+    from .module_tools import DBModules
 
     dangling = list(DBModules.get_dangling_modules())
     if dangling:
@@ -729,8 +945,10 @@ def show_dangling():
     return bool(dangling)
 
 
-def _do_check_install_state(ctx, config, module, all_modules, no_dangling_check):
-    from .module_tools import Modules, DBModules, Module
+def _do_check_install_state(
+    ctx, config, module, all_modules, no_dangling_check
+):
+    from .module_tools import DBModules
 
     if all_modules:
         ctx.invoke(
@@ -739,7 +957,9 @@ def _do_check_install_state(ctx, config, module, all_modules, no_dangling_check)
             missing_as_error=True,
         )
     else:
-        missing = list(DBModules.check_if_all_modules_from_install_are_installed())
+        missing = DBModules.check_if_all_modules_from_install_are_installed(
+            partial(remove_some_modules, config)
+        )
         problem_missing = set()
         for module in module:
             if module in missing:
@@ -751,11 +971,13 @@ def _do_check_install_state(ctx, config, module, all_modules, no_dangling_check)
 
 
 def _do_dangling_check(ctx, config, dangling_modules, non_interactive):
-    from .module_tools import Modules, DBModules, Module
+    from .module_tools import DBModules
 
     if any(x[1] == "uninstallable" for x in DBModules.get_dangling_modules()):
         if non_interactive:
-            abort("Danling modules exist. Provide --no-dangling-check otherwise.")
+            abort(
+                "Danling modules exist. Provide --no-dangling-check otherwise."
+            )
         for x in DBModules.get_dangling_modules():
             click.echo("{}: {}".format(*x[:2]))
         if (
@@ -796,14 +1018,15 @@ def _parse_modules(modules):
 @click.pass_context
 def uninstall(ctx, config, modules):
     modules = _parse_modules(modules)
-    _uninstall_marked_modules(config, modules)
+    _uninstall_marked_modules(ctx, config, modules)
 
 
-def _uninstall_marked_modules(config, modules):
+def _uninstall_marked_modules(ctx, config, modules, no_restart=False):
     """
     Checks for file "uninstall" in customs root and sets modules to uninstalled.
     """
-    from .module_tools import Modules, DBModules, Module
+    from .module_tools import DBModules, Module
+    from .module_tools import NotInAddonsPath
 
     assert not isinstance(modules, str)
 
@@ -819,24 +1042,72 @@ def _uninstall_marked_modules(config, modules):
 
     if config.use_docker:
         from .lib_control_with_docker import shell as lib_shell
+    manifest_modules = get_all_modules_installed_by_manifest(config)
 
+    uninstalled = False
+    effective_uninstall = []
+    errors = []
     for module in modules:
-        click.secho(f"Uninstall {module}", fg="red")
-        lib_shell(
-            config,
-            (
-                "self.env['ir.module.module'].search(["
-                f"('name', '=', '{module}'),"
-                "('state', 'in', "
-                "['to upgrade', 'to install', 'installed']"
-                ")]).module_uninstall()\n"
-                "self.env.cr.commit()"
-            ),
+        try:
+            objmod = Module.get_by_name(module)
+            for desc in objmod.descendants:
+                if desc in manifest_modules:
+                    if not Module.get_by_name(desc).manifest_dict.get(
+                        "auto_install"
+                    ):
+                        errors.append(
+                            (
+                                f"{objmod.name} has {desc.name} as descendant "
+                                "which is still in the install section"
+                            )
+                        )
+        except NotInAddonsPath:
+            pass
+        else:
+            effective_uninstall.append(module)
+    if errors:
+        abort("\n".join(errors))
+    if effective_uninstall:
+        module_comma = ",".join(
+            map(lambda x: f"'{x}'", sorted(effective_uninstall))
         )
+        if len(effective_uninstall) > 10:
+            click.secho(
+                f"Uninstalling {len(effective_uninstall)} modules", fg="red"
+            )
+        else:
+            click.secho(f"Uninstall {module_comma}", fg="red")
+        module_comma = f"[{module_comma}]"
+        cmd = f"""
+modules = self.env['ir.module.module'].search([('state', 'in', ['to upgrade', 'to install', 'installed'])])
+modules = modules.filtered(lambda x: x.name in {module_comma})
+for module in modules:
+    try:
+        print("-----------------------------------------------------------")
+        print("Uninstalling: " + module.name)
+        print("-----------------------------------------------------------")
+        module.module_uninstall()
+        self.env.cr.commit()
+    except Exception as ex:
+        print("-----------------------------------------------------------")
+        print("ERROR UNINSTALL " + module.name)
+        print(ex)
+        print("-----------------------------------------------------------")
+    finally:
+        env.clear()
+        env.cr.rollback()
+            """
+        lib_shell(config, cmd)
         del module
+        uninstalled = True
+
+    if uninstalled and not no_restart:
+        if os.getenv("DOCKER_MACHINE") != "1":
+            Commands.invoke(ctx, "restart", machines=["odoo"])
 
     modules = [x for x in modules if DBModules.is_module_installed(x)]
     if modules:
+        click.secho(cmd, fg="yellow")
         abort(f"Failed to uninstall: {','.join(modules)}")
 
 
@@ -859,7 +1130,7 @@ def update_i18n(ctx, config, module, no_restart):
     )  # '1,2 3' --> ['1', '2', '3']
 
     if not module:
-        module = _get_default_modules_to_update()
+        module = _get_default_modules_to_update(config)
 
     try:
         params = [",".join(module)]
@@ -873,7 +1144,9 @@ def update_i18n(ctx, config, module, no_restart):
     except Exception:
         click.echo(traceback.format_exc())
         ctx.invoke(show_install_state, suppress_error=True)
-        raise Exception("Error at /update_modules.py - aborting update process.")
+        raise Exception(
+            "Error at /update_modules.py - aborting update process."
+        )
 
     if not no_restart:
         Commands.invoke(ctx, "restart", machines=["odoo"])
@@ -891,7 +1164,9 @@ def show_install_state(config, suppress_error=False, missing_as_error=False):
         click.echo("{}: {}".format(row[0], row[1]))
 
     # get modules, that are not installed:
-    missing = list(DBModules.check_if_all_modules_from_install_are_installed())
+    missing = DBModules.check_if_all_modules_from_install_are_installed(
+        partial(remove_some_modules, config)
+    )
     for missing_item in missing:
         click.secho((f"Module {missing_item} not installed!"), fg="red")
 
@@ -908,220 +1183,63 @@ def show_install_state(config, suppress_error=False, missing_as_error=False):
 
 
 @odoo_module.command(name="show-addons-paths")
-def show_addons_paths():
+@pass_config
+def show_addons_paths(config):
     from .odoo_config import get_odoo_addons_paths
 
-    paths = get_odoo_addons_paths()
+    paths = get_odoo_addons_paths(
+        additional_addons_paths=config.ADDITIONAL_ADDONS_PATHS.split(",")
+    )
     for path in paths:
         click.echo(path)
 
 
 @odoo_module.command(name="show-conflicting-modules")
-def show_conflicting_modules():
+@pass_config
+def show_conflicting_modules(config):
     from .odoo_config import get_odoo_addons_paths
 
-    get_odoo_addons_paths()
+    get_odoo_addons_paths(
+        additional_addons_paths=config.ADDITIONAL_ADDONS_PATHS.split(",")
+    )
 
 
-def _exec_update(config, params, non_interactive=False):
-    params = ["odoo_update", "/update_modules.py"] + params
-    if not non_interactive:
-        yield __cmd_interactive(
-            config,
-            *(
-                [
-                    "run",
-                    "--rm",
-                ]
-                + params
-            ),
-        )
-    else:
-        try:
-            returncode, output = __dcrun(config, list(params), returnproc=True)
-            yield returncode
-            yield output
-        except subprocess.CalledProcessError as ex:
-            yield ex.returncode
-
-
-def _get_available_robottests(ctx, param, incomplete):
-    from .robo_helpers import _get_all_robottest_files
-    from .odoo_config import customs_dir
-
-    path = customs_dir() or Path(os.getcwd())
-    path = path / (Path(os.getcwd()).relative_to(path))
-    testfiles = list(map(str, _get_all_robottest_files(path))) or []
-    if incomplete:
-        if "/" in incomplete:
-            testfiles = list(filter(lambda x: str(x).startswith(incomplete), testfiles))
-        else:
-            testfiles = list(filter(lambda x: incomplete in x, testfiles))
-    return sorted(testfiles)
-
-
-@odoo_module.command()
-@click.argument("file", required=False, shell_complete=_get_available_robottests)
-@click.option("-u", "--user", default="admin")
-@click.option("-a", "--all", is_flag=True)
-@click.option("-n", "--test_name", is_flag=False)
-@click.option(
-    "-p", "--param", multiple=True, help="e.g. --param key1=value1 --param key2=value2"
-)
-@click.option("--parallel", default=1, help="Parallel runs of robots.")
-@click.option(
-    "--keep-token-dir",
-    is_flag=True,
-    help="If set, then the intermediate run directory is kept. Helps to separate test runs of same robot file safely.",
-)
-@click.option(
-    "-t",
-    "--tags",
-    is_flag=False,
-    help=(
-        "Tags can be comined with AND OR or just comma separated; "
-        "may include wilcards and some regex expressions"
-    ),
-)
-@click.option(
-    "-j",
-    "--output-json",
-    is_flag=True,
-    help=("If set, then a json is printed to console, with detailed informations"),
-)
-@click.option(
-    "--results-file", help="concrete filename where the results.json is stored"
-)
-@pass_config
-@click.pass_context
-def robotest(
-    ctx,
-    config,
-    file,
-    user,
-    all,
-    tags,
-    test_name,
-    param,
-    parallel,
-    output_json,
-    keep_token_dir,
-    results_file,
+def _exec_update(
+    config, params, non_interactive=False, stdout=False, write_to_console=True
 ):
-    PARAM = param
-    del param
-    started = arrow.utcnow()
-
-    from pathlib import Path
-    from .odoo_config import customs_dir
-    from .module_tools import DBModules
-
-    if not config.devmode and not config.force:
-        click.secho(
-            ("Devmode required to run unit tests. Database will be destroyed."),
-            fg="red",
-        )
-        sys.exit(-1)
-
-    from .robo_helpers import _select_robot_filename
-
-    filenames = _select_robot_filename(file, run_all=all)
-    del file
-
-    if not filenames:
-        return
-
-    click.secho("\n".join(map(str, filenames)), fg="green", bold=True)
-
-    from .robo_helpers import get_odoo_modules
-
-    os.chdir(customs_dir())
-    odoo_modules = set(get_odoo_modules(config.verbose, filenames, customs_dir()))
-    odoo_modules = list(odoo_modules | set(["web_selenium", "robot_utils"]))
-
-    if odoo_modules:
-
-        def not_installed(module):
-            data = DBModules.get_meta_data(module)
-            if not data:
-                abort(f"Could not get state for {module}")
-            return data["state"] == "uninstalled"
-
-        modules_to_install = list(filter(not_installed, odoo_modules))
-        if modules_to_install:
-            click.secho(
-                (
-                    "Installing required modules for robot tests: "
-                    f"{','.join(modules_to_install)}"
+    if os.getenv("DOCKER_MACHINE") == "1":
+        ret =  subprocess.run([os.getenv("WODOO_PYTHON")] + ["/odoolib/update_modules.py"] + params)
+        yield ret.returncode
+    else:
+        params = ["odoo_update", "/odoolib/update_modules.py"] + params
+        if not non_interactive:
+            yield __cmd_interactive(
+                config,
+                *(
+                    [
+                        "run",
+                        "--rm",
+                    ]
+                    + params
                 ),
-                fg="yellow",
             )
-            Commands.invoke(
-                ctx, "update", module=modules_to_install, no_dangling_check=True
-            )
-
-    pwd = config.DEFAULT_DEV_PASSWORD
-    if pwd == "True" or pwd is True:
-        pwd = "1"
-
-    def params():
-        params = {
-            "url": "http://proxy",
-            "user": user,
-            "dbname": config.DBNAME,
-            "password": pwd,
-            "selenium_timeout": 20,  # selenium timeout,
-            "parallel": parallel,
-        }
-        if test_name:
-            params["test_name"] = test_name
-        if tags:
-            params["tags"] = tags
-
-        for param in PARAM:
-            k, v = param.split("=")
-            params[k] = v
-            del param
-
-        return params
-
-    token = arrow.get().strftime("%Y-%m-%d_%H%M%S_") + str(uuid.uuid4())
-    data = json.dumps(
-        {
-            "test_files": list(map(str, filenames)),
-            "token": token,
-            "results_file": results_file or "",
-            "params": params(),
-        }
-    )
-    data = base64.b64encode(data.encode("utf-8"))
-
-    params = [
-        "robot",
-    ]
-
-    workingdir = customs_dir() / (Path(os.getcwd()).relative_to(customs_dir()))
-    os.chdir(workingdir)
-
-    __dcrun(config, params, pass_stdin=data.decode("utf-8"), interactive=True)
-
-    output_path = config.HOST_RUN_DIR / "odoo_outdir" / "robot_output"
-    from .robo_helpers import _eval_robot_output
-
-    _eval_robot_output(
-        config,
-        output_path,
-        started,
-        output_json,
-        token,
-        rm_tokendir=not keep_token_dir,
-        results_file=results_file,
-    )
+        else:
+            try:
+                returncode, output = __dcrun(
+                    config,
+                    list(params),
+                    returnproc=True,
+                    interactive=False,
+                    write_to_console=write_to_console,
+                )
+                yield returncode
+                yield output
+            except subprocess.CalledProcessError as ex:
+                yield ex.returncode
 
 
 def _get_unittests_from_module(module_name):
     from .module_tools import Module
-    from .odoo_config import MANIFEST_FILE
 
     testfiles = []
     module = Module.get_by_name(module_name)
@@ -1138,17 +1256,29 @@ def _get_unittests_from_modules(module_names):
 
 
 def _get_all_unittest_files(config):
-    from .odoo_config import MANIFEST
-    from .module_tools import Modules
-
-    modules = Modules().get_all_modules_installed_by_manifest()
+    modules = get_all_modules_installed_by_manifest(config)
     return _get_unittests_from_modules(modules)
 
 
 @odoo_module.command()
+@click.option(
+    "-m",
+    "--manifest",
+    help="Evaluate 'tests' section in MANIFEST",
+    is_flag=True,
+)
 @pass_config
-def list_unit_test_files(config):
+def list_unit_test_files(config, manifest):
+    from .odoo_config import MANIFEST
+
     files = _get_all_unittest_files(config)
+
+    if manifest:
+        tests = MANIFEST().get("tests", [])
+        files = list(
+            filter(lambda file: str(Path(file).parent.parent) in tests, files)
+        )
+
     click.secho("!!!")
     for file in files:
         click.secho(file)
@@ -1177,14 +1307,20 @@ def list_robot_test_files(config):
 @click.option("--log", is_flag=True)
 @pass_config
 def unittest(
-    config, file, remote_debug, wait_for_remote, non_interactive, output_json, tags, log
+    config,
+    file,
+    remote_debug,
+    wait_for_remote,
+    non_interactive,
+    output_json,
+    tags,
+    log,
 ):
     """
     Collects unittest files and offers to run
     """
-    from .odoo_config import MANIFEST, MANIFEST_FILE, customs_dir
+    from .odoo_config import customs_dir
     from .module_tools import Module
-    from pathlib import Path
 
     if file and "/" not in file:
         try:
@@ -1214,18 +1350,13 @@ def unittest(
         return
 
     for todoitem in todo:
-        click.secho(str(todoitem), fg="green", bold=True)
-
-    def filepath_to_container(filepath):
-        return Path("/opt/src/") / filepath
-
-    container_files = list(map(filepath_to_container, todo))
+        click.secho(str(todoitem), fg="blue", bold=True)
 
     interactive = True  # means pudb trace turned on
     params = [
         "odoo",
         "/odoolib/unit_test.py",
-        f'{",".join(map(str, container_files))}',
+        f'{",".join(map(str, todo))}',
     ]
     if wait_for_remote:
         remote_debug = True
@@ -1269,11 +1400,13 @@ def unittest(
 
         if passed:
             click.secho(
-                tabulate(passed, headers="keys", tablefmt="fancy_grid"), fg="green"
+                tabulate(passed, headers="keys", tablefmt="fancy_grid"),
+                fg="green",
             )
         if errors:
             click.secho(
-                tabulate(errors, headers="keys", tablefmt="fancy_grid"), fg="red"
+                tabulate(errors, headers="keys", tablefmt="fancy_grid"),
+                fg="red",
             )
     if errors:
         sys.exit(-1)
@@ -1283,12 +1416,11 @@ def unittest(
 @pass_config
 @click.pass_context
 def generate_update_command(ctx, config):
-    modules = _get_default_modules_to_update()
+    modules = _get_default_modules_to_update(config)
     click.secho(f"-u {','.join(modules)}")
 
 
 def _get_changed_files(git_sha):
-    from .module_tools import Module
     from .tools import git_diff_files
 
     cwd = os.getcwd()
@@ -1315,22 +1447,18 @@ def _get_changed_files(git_sha):
         if submodule:
             current_commit = str(repo.hex)
             relpath = filepath.relative_to(repo.path)
-            old_commit = (
-                subprocess.check_output(
-                    [
-                        "git",
-                        "rev-parse",
-                        f"{git_sha}:./{relpath}",
-                    ], encoding='utf8'
-                )
-                .strip()
-            )
-            new_commit = (
-                subprocess.check_output(
-                    ["git", "rev-parse", f"{current_commit}:./{relpath}"], encoding='utf8',
-                )
-                .strip()
-            )
+            old_commit = subprocess.check_output(
+                [
+                    "git",
+                    "rev-parse",
+                    f"{git_sha}:./{relpath}",
+                ],
+                encoding="utf8",
+            ).strip()
+            new_commit = subprocess.check_output(
+                ["git", "rev-parse", f"{current_commit}:./{relpath}"],
+                encoding="utf8",
+            ).strip()
             # now diff the submodule
             for filepath2 in git_diff_files(filepath, old_commit, new_commit):
                 filepaths2.append(str(relpath / filepath2))
@@ -1365,10 +1493,13 @@ def list_changed_files(ctx, config, start):
 
 
 def _get_global_hash_paths(relative_to_customs_dir=False):
-    from .odoo_config import customs_dir
+    from .odoo_config import customs_dir, MANIFEST
+
+    manifest = MANIFEST()
 
     customs_dir_path = customs_dir()
-    odoo_path = customs_dir_path / "odoo"
+    odoo_dir = manifest.odoo_dir
+    odoo_path = customs_dir_path / odoo_dir
     global_hash_paths = [
         odoo_path / "odoo",
         odoo_path / "requirements.txt",
@@ -1377,6 +1508,7 @@ def _get_global_hash_paths(relative_to_customs_dir=False):
     if not relative_to_customs_dir:
         return global_hash_paths
     return [p.relative_to(customs_dir_path) for p in global_hash_paths]
+
 
 hash_cache = {}
 
@@ -1388,18 +1520,32 @@ def _get_directory_hash(path):
 
 
 @odoo_module.command()
-@click.argument("module", required=True)
-@click.option("-N", "--no-cache", is_flag=True)
+@click.argument("module", required=True, shell_complete=_get_available_modules)
+@click.option("-f", "--following", is_flag=True)
+@click.option("-c", "--customs", is_flag=True)
 @pass_config
 @click.pass_context
-def list_deps(ctx, config, module, no_cache):
+def list_descendants(ctx, config, module, customs, following):
+    from .module_tools import Module
+
+    mod = Module.get_by_name(module)
+    res = mod.descendants
+    for mod in res:
+        click.secho(f"descedant: {mod}", fg="green")
+
+
+@odoo_module.command()
+@click.argument("module", required=True, shell_complete=_get_available_modules)
+@click.option("-N", "--no-cache", is_flag=True)
+@click.option("-c", "--customs", is_flag=True)
+@pass_config
+@click.pass_context
+def list_deps(ctx, config, module, no_cache, customs):
     import arrow
 
     started = arrow.get()
-    from .module_tools import Modules, DBModules, Module
+    from .module_tools import Modules, Module
     from .module_tools import NotInAddonsPath
-    from .odoo_config import customs_dir
-    from .consts import FILE_DIRHASHES
 
     click.secho("Loading Modules...", fg="yellow")
     modules = Modules()
@@ -1414,7 +1560,12 @@ def list_deps(ctx, config, module, no_cache):
     for module in module:
         data = {"modules": []}
         data["modules"] = sorted(
-            list(map(lambda x: x.name, modules.get_module_flat_dependency_tree(module)))
+            list(
+                map(
+                    lambda x: x.name,
+                    modules.get_module_flat_dependency_tree(module),
+                )
+            )
             + [module.name]
         )
 
@@ -1478,7 +1629,22 @@ def list_deps(ctx, config, module, no_cache):
             result[module.name] = data
 
     click.secho("---")
+    if customs:
+        result = _filter_customs(result)
     click.secho(json.dumps(result, indent=4))
+
+
+def _filter_customs(modules):
+    modules2 = {}
+    from .module_tools import Module
+
+    def _filter(module_name):
+        mod = Module.get_by_name(module_name)
+        return mod.is_customs
+
+    for key in ["modules", "auto_install"]:
+        modules[key] = list(filter(_filter, modules[key]))
+    return modules
 
 
 @odoo_module.command()
@@ -1487,10 +1653,24 @@ def migrate():
         (
             "To migrate odoo 14.0 to 15.0 you would do:\n\n"
             "  * odoo download-openupgrade\n"
-            "  * change gimera.yml to point to odoo 15 (and other modules)\n"
-            "  * change version in MANIFEST to version 15\n"
+            "  * change gimera.yml to point to newer odoo version (and other modules)\n"
+            "  * change version in MANIFEST to new version\n"
+            "  * gimera purge\n"
             "  * gimera apply --update \n"
-            "  * odoo update --config-file config_migration\n"
+            "  * add 'openupgrade' to MANIFEST['addons-paths']\n"
+            "  * add 'openupgrade_framework' to server-wide-modules\n"
+            "  * add: MANIFEST['upgrade_path'] = ['/opt/src/openupgrade/openupgrade_scripts/scripts']\n"
+            "  * odoo update config_migration\n"
+            " \n"
+            "  NOTE:  there is also an official odoo upgrade helper at: https://github.com/OCA/openupgrade\n"
+            "  To install this official package: \n"
+            "  1. gimera.yml:\n"
+            "    - branch: master\n"
+            "       path: upgrade-util\n"
+            "       type: integrated\n"
+            "       url: https://github.com/odoo/upgrade-util.git\n"
+            "  2. MANIFEST:\n"
+            '    - ["update_path"] = ["upgrade_util/src"]\n'
             "\n"
         ),
         fg="green",
@@ -1498,15 +1678,42 @@ def migrate():
 
 
 @odoo_module.command()
+@click.option(
+    "--skip-odoo",
+    is_flag=True,
+    help="Skip odoo modules (default: False)",
+)
+@click.option(
+    "--skip-enterprise",
+    is_flag=True,   
+    help="Skip enterprise modules (default: False)",
+)
+@click.option(
+    "--skip-oca",
+    is_flag=True,
+    help="Skip OCA modules (default: False)",
+)
 @pass_config
 @click.pass_context
-def list_modules(ctx, config):
-    from .module_tools import Modules, DBModules
+def list_modules(ctx, config, skip_odoo, skip_enterprise, skip_oca):
+    modules = list(sorted(get_all_modules_installed_by_manifest(config)))
+    from .module_tools import Modules, Module
+    from .odoo_config import MANIFEST
+    m = MANIFEST()
+    odoo_dir = m.get("odoo_dir", "odoo")
 
-    mods = Modules()
-    modules = list(sorted(mods.get_all_modules_installed_by_manifest()))
+    def _filter(module):
+        m = Module.get_by_name(module)
+        if skip_odoo and str(m.path).startswith(odoo_dir + "/"):
+            return False
+        if skip_enterprise and str(m.path).startswith("enterprise/"):
+            return False
+        if skip_oca and 'oca' in str(m.path).split("/")[0].lower():
+            return False
+        return True
+
     print("---")
-    for m in modules:
+    for m in [x for x in modules if _filter(x)]:
         print(m)
 
 
@@ -1514,7 +1721,7 @@ def list_modules(ctx, config):
 @pass_config
 @click.pass_context
 def list_outdated_modules(ctx, config):
-    modules = _get_default_modules_to_update()
+    modules = _get_default_modules_to_update(config)
 
     def _get_outdated_modules(module):
         return list(
@@ -1572,7 +1779,6 @@ def _get_changed_modules(git_sha):
 def list_installed_modules(config, fix_not_in_manifest, only_customs):
     from .module_tools import DBModules, Module
     from .module_tools import NotInAddonsPath
-    from .odoo_config import customs_dir
     from .odoo_config import MANIFEST
 
     collected = []
@@ -1584,15 +1790,19 @@ def list_installed_modules(config, fix_not_in_manifest, only_customs):
         try:
             mod = Module.get_by_name(module)
         except (Module.IsNot, NotInAddonsPath):
-            click.secho(f"Ignoring {module} - not found in source", fg="yellow")
+            click.secho(
+                f"Ignoring {module} - not found in source", fg="yellow"
+            )
             continue
         if only_customs:
             try:
                 parts = mod.path.parts
             except Module.IsNot:
-                click.secho(f"Ignoring {module} - not found in source", fg="yellow")
+                click.secho(
+                    f"Ignoring {module} - not found in source", fg="yellow"
+                )
                 continue
-            if any(x in parts for x in ["odoo", "enterprise", "themes"]):
+            if not mod.is_customs:
                 continue
         try:
             click.secho(f"{module}: {mod.path}", fg="green")
@@ -1615,5 +1825,104 @@ def list_installed_modules(config, fix_not_in_manifest, only_customs):
         manifest.rewrite()
 
 
+@odoo_module.command()
+@click.argument("module", required=True, shell_complete=_get_available_modules)
+@click.pass_context
+@pass_config
+def zip(config, ctx, module):
+    from .module_tools import Module
+
+    try:
+        mod = Module.get_by_name(module)
+        module_path = Path(os.getcwd()) / mod.path
+    except:
+        module_path = Path(os.getcwd()) / module
+
+    if not module_path.exists():
+        abort(f"{module_path} not found.")
+
+    zipfile = Path(os.getcwd()) / f"{module}.zip"
+    if zipfile.exists():
+        zipfile.unlink()
+    subprocess.check_call(
+        ["/usr/bin/zip", "-r", zipfile.name, "."], cwd=module_path
+    )
+    shutil.move(Path(module_path / zipfile.name), zipfile)
+    click.secho(f"Created zipfile: {zipfile}", fg="green")
+
+
+@odoo_module.command()
+@click.argument("module", required=True)
+@click.argument("repourl", required=True)
+@click.option("--update", is_flag=True)
+@click.pass_context
+@pass_config
+def download_module(config, ctx, module, repourl, update):
+    _make_sure_module_is_installed(ctx, config, module, repourl, update)
+    click.secho(f"Successfully downloaded and installed {module}", fg="green")
+
+
+@odoo_module.command()
+@click.pass_context
+@pass_config
+def scan_addons_paths(config, ctx):
+    from .odoo_config import customs_dir
+
+    res = set()
+    root = customs_dir()
+    for path in root.rglob("__manifest__.py"):
+        res.add(path.parent.parent.relative_to(root))
+    for item in sorted(res):
+        click.secho(str(item))
+
+
+class ProgressBarDaemon(threading.Thread):
+    def __init__(self, interval=1.0):
+        super().__init__(daemon=True)
+        self.interval = interval
+        self.running = True
+        self.total = None
+        self.pbar = tqdm(
+            total=100,
+            bar_format="\033[95m{l_bar}{bar}\033[0m {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+            dynamic_ncols=True,
+        )
+        self.pbar.set_description("Waiting for update process")
+
+    def run(self):
+        while self.running:
+            self.pbar.refresh()
+            time.sleep(self.interval)
+
+    def get_total(self):
+        return self.get_to_install_modules()
+
+    def get_to_install_modules(self):
+        with get_conn_autoclose() as cr:
+            cr.execute(
+                "select count(*) from ir_module_module where state in ('to install', 'to upgrade')"
+            )
+            record = cr.fetchone()
+        return record[0]
+
+    def update_progress(self, module, progress, total):
+        self.pbar.total = total
+        self.pbar.n = progress
+        text = module.ljust(40)
+        self.pbar.set_description(text)
+
+    def write(self, line):
+        if self.pbar:
+            self.pbar.write(line)
+        else:
+            print(line)
+
+    def stop(self):
+        self.running = False
+        if self.pbar:
+            self.pbar.close()
+
+
 Commands.register(update)
 Commands.register(show_install_state)
+Commands.register(uninstall)

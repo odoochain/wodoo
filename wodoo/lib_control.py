@@ -1,16 +1,18 @@
+import time
 import click
-from subprocess import Popen, PIPE
 
 import re
 import os
 from .cli import cli, pass_config, Commands
 from .lib_clickhelpers import AliasedGroup
 from .tools import execute_script
+from .tools import force_input_hostname
 import subprocess
-import json
-from pathlib import Path
 from .tools import abort
 from .tools import ensure_project_name
+from .tools import print_prod_env
+from .tools import _shell_complete_machines
+from .tools import _shell_complete_services
 
 
 @cli.group(cls=AliasedGroup)
@@ -38,7 +40,7 @@ def dev(ctx, config, build, kill):
     ensure_project_name(config)
     if config.use_docker:
         from .lib_control_with_docker import dev as lib_dev
-    return lib_dev(ctx, config, build, kill)
+    return lib_dev(ctx, config, build, kill=kill)
 
 
 @docker.command(name="ps")
@@ -51,7 +53,9 @@ def ps(config):
 
 
 @docker.command(name="exec")
-@click.argument("machine", required=True)
+@click.argument(
+    "machine", required=True, shell_complete=_shell_complete_machines
+)
 @click.argument("args", nargs=-1)
 @pass_config
 def execute(config, machine, args):
@@ -62,16 +66,20 @@ def execute(config, machine, args):
 
 
 @docker.command(name="kill")
-@click.argument("machines", nargs=-1)
+@click.argument("machines", nargs=-1, shell_complete=_shell_complete_machines)
 @click.option("-b", "--brutal", is_flag=True, help="dont wait")
+@click.option("-p", "--profile")
 @pass_config
 @click.pass_context
-def do_kill(ctx, config, machines, brutal=False):
+def do_kill(ctx, config, machines, brutal, profile):
     ensure_project_name(config)
+    if config.devmode:
+        click.secho("Being brutal because in devmode", fg="red")
+        brutal = True
     if config.use_docker:
         from .lib_control_with_docker import do_kill as lib_do_kill
 
-        lib_do_kill(ctx, config, machines, brutal=False)
+        lib_do_kill(ctx, config, machines, brutal=brutal, profile=profile)
 
 
 @docker.command()
@@ -86,7 +94,7 @@ def remove_volumes(ctx, config, dry_run):
     ensure_project_name(config)
     if not config.devmode:
         if not config.force:
-            abort("Please provide force option on non live systems")
+            abort("Please provide force option on non dev systems")
     if not config.use_docker:
         return
     subprocess.check_call(["sync"])
@@ -95,7 +103,8 @@ def remove_volumes(ctx, config, dry_run):
         click.secho(f"Removing: {vol}", fg="red")
         if not dry_run:
             rc = subprocess.run(
-                ["docker", "volume", "rm", "-f", vol], encoding="utf8",
+                ["docker", "volume", "rm", "-f", vol],
+                encoding="utf8",
                 capture_output=True,
             )
             if rc.returncode:
@@ -103,10 +112,24 @@ def remove_volumes(ctx, config, dry_run):
                 for group in re.findall(r"(\[[^\]]*])", output):
                     container_id = group[1:-1]
                     subprocess.run(["docker", "kill", container_id])
-                    subprocess.check_call(["docker", "rm", "-fv", container_id])
-                    output = subprocess.check_output(
-                        ["docker", "volume", "rm", "-f", vol], encoding="utf8"
+                    subprocess.check_call(
+                        ["docker", "rm", "-fv", container_id]
                     )
+                    counter = 0
+                    while counter < 5:
+                        try:
+                            output = subprocess.check_output(
+                                ["docker", "volume", "rm", "-f", vol],
+                                encoding="utf8",
+                            )
+                            break
+                        except:
+                            click.secho(
+                                f"Removing the volume {vol} failed - waiting and retrying.",
+                                fg="red",
+                            )
+                            time.sleep(2)
+                            counter += 1
 
         if dry_run:
             click.secho("Dry Run - didnt do it.")
@@ -114,6 +137,7 @@ def remove_volumes(ctx, config, dry_run):
 
 @docker.command()
 @pass_config
+@click.argument("machine", nargs=-1, shell_complete=_shell_complete_machines)
 @click.pass_context
 def force_kill(ctx, config, machine):
     if config.use_docker:
@@ -142,10 +166,10 @@ def wait_for_port(config, host, port):
 
 
 @docker.command()
-@click.argument("machines", nargs=-1)
+@click.argument("machines", nargs=-1, shell_complete=_shell_complete_services)
 @pass_config
 @click.pass_context
-def recreate(ctx, config, machines):
+def recreate(ctx, config, machines, shell_complete=_shell_complete_services):
     ensure_project_name(config)
     if config.use_docker:
         from .lib_control_with_docker import recreate as lib_recreate
@@ -153,7 +177,7 @@ def recreate(ctx, config, machines):
 
 
 @docker.command()
-@click.argument("machines", nargs=-1)
+@click.argument("machines", nargs=-1, shell_complete=_shell_complete_services)
 @click.option("-d", "--daemon", is_flag=True)
 @pass_config
 @click.pass_context
@@ -164,14 +188,16 @@ def up(ctx, config, machines, daemon):
 
     lib_up(ctx, config, machines, daemon, remove_orphans=True)
     execute_script(
-        config, config.files["after_up_script"], "Possible after up script here:"
+        config,
+        config.files["after_up_script"],
+        "Possible after up script here:",
     )
     if daemon:
         _status(config)
 
 
 @docker.command()
-@click.argument("machines", nargs=-1)
+@click.argument("machines", nargs=-1, shell_complete=_shell_complete_services)
 @click.option("-v", "--volumes", is_flag=True)
 @click.option("--remove-orphans", is_flag=True)
 @click.option("--postgres-volume", is_flag=True)
@@ -181,6 +207,15 @@ def down(ctx, config, machines, volumes, remove_orphans, postgres_volume):
     ensure_project_name(config)
     from .lib_control_with_docker import down as lib_down
     from .lib_db_snapshots_docker_zfs import NotZFS
+
+    if not config.devmode:
+        if not config.force:
+            abort("Please provide force option on non live systems")
+
+    print_prod_env(config)
+
+    if not config.devmode and volumes:
+        force_input_hostname()
 
     if postgres_volume or volumes:
         if postgres_volume:
@@ -196,7 +231,7 @@ def down(ctx, config, machines, volumes, remove_orphans, postgres_volume):
 
 
 @docker.command()
-@click.argument("machines", nargs=-1)
+@click.argument("machines", nargs=-1, shell_complete=_shell_complete_machines)
 @pass_config
 @click.pass_context
 def stop(ctx, config, machines):
@@ -207,7 +242,7 @@ def stop(ctx, config, machines):
 
 
 @docker.command()
-@click.argument("machines", nargs=-1)
+@click.argument("machines", nargs=-1, shell_complete=_shell_complete_machines)
 @pass_config
 @click.pass_context
 def rebuild(ctx, config, machines):
@@ -218,29 +253,33 @@ def rebuild(ctx, config, machines):
 
 
 @docker.command()
-@click.argument("machines", nargs=-1)
+@click.argument("machines", nargs=-1, shell_complete=_shell_complete_machines)
+@click.option("-p", "--profile", default="auto")
 @pass_config
 @click.pass_context
-def restart(ctx, config, machines):
+def restart(ctx, config, machines, profile):
     ensure_project_name(config)
     from .lib_control_with_docker import restart as lib_restart
 
-    lib_restart(ctx, config, machines)
+    lib_restart(ctx, config, machines, profile=profile)
 
 
 @docker.command()
-@click.argument("machines", nargs=-1)
+@click.argument("machines", nargs=-1, shell_complete=_shell_complete_machines)
+@click.option("-p", "--profile", default="auto")
 @pass_config
 @click.pass_context
-def rm(ctx, config, machines):
+def rm(ctx, config, machines, profile):
     ensure_project_name(config)
     from .lib_control_with_docker import rm as lib_rm
 
-    lib_rm(ctx, config, machines)
+    lib_rm(ctx, config, machines, profile=profile)
 
 
 @docker.command()
-@click.argument("machine", required=True)
+@click.argument(
+    "machine", required=True, shell_complete=_shell_complete_machines
+)
 @pass_config
 @click.pass_context
 def attach(ctx, config, machine):
@@ -251,49 +290,107 @@ def attach(ctx, config, machine):
 
 
 @docker.command()
-@click.argument("machines", nargs=-1)
+@click.argument("machines", nargs=-1, shell_complete=_shell_complete_services)
 @click.option("--no-cache", is_flag=True)
 @click.option("--pull", is_flag=True)
 @click.option("--push", is_flag=True)
 @click.option("-p", "--plain", is_flag=True)
+@click.option("-s", "--include-source", is_flag=True)
+@click.option(
+    "--platform",
+    type=click.Choice(["linux/amd64", "linux/arm64"], case_sensitive=False),
+    default=None,
+    help="Build for a specific platform",
+)
 @pass_config
 @click.pass_context
-def build(ctx, config, machines, pull, no_cache, push, plain):
+def build(
+    ctx,
+    config,
+    machines,
+    pull,
+    no_cache,
+    push,
+    plain,
+    include_source,
+    platform,
+):
+    import yaml
+    from .lib_cached_build import start_squid_proxy, start_proxpi
+
+    from .myconfigparser import MyConfigParser
+
+    settings = MyConfigParser(config.files["settings"])
+
+    if settings.get("RUN_APT_CACHER") in ["1", ""]:
+        start_squid_proxy(config)
+        start_proxpi(config)
+
     ensure_project_name(config)
     if plain:
         os.environ["BUILDKIT_PROGRESS"] = "plain"
     from .lib_control_with_docker import build as lib_build
 
-    lib_build(ctx, config, machines, pull, no_cache, push)
+    if not machines:
+        compose = yaml.safe_load(config.files["docker_compose"].read_text())
+        machines = []
+        for service in compose["services"]:
+            if not compose["services"][service].get("build", {}).get("imgage"):
+                machines.append(service)
+
+    lib_build(
+        ctx,
+        config,
+        machines,
+        pull,
+        no_cache,
+        push,
+        include_source,
+        platform=platform,
+    )
 
 
 @docker.command()
-@click.argument("machine", required=True)
+@click.argument(
+    "machine", required=True, shell_complete=_shell_complete_services
+)
 @click.option("-c", "--command", required=False, help="Like /odoolib/debug.py")
 @click.option("-p", "--ports", is_flag=True, help="With Port 33284")
+@click.option("--port", help="Define the debug port")
 @pass_config
 @click.pass_context
-def debug(ctx, config, machine, ports, command):
+def debug(ctx, config, machine, ports, command, port):
     ensure_project_name(config)
     from .lib_control_with_docker import debug as lib_debug
 
-    lib_debug(ctx, config, machine, ports, cmd=command)
+    if port:
+        ports = int(port)
+
+    lib_debug(ctx, config, machine, ports=port, cmd=command)
 
 
 @cli.command()
-@click.argument("machine", required=True)
+@click.argument(
+    "machine", required=True, shell_complete=_shell_complete_services
+)
 @click.argument("args", nargs=-1)
+@click.option("-d", "--detached", is_flag=True)
+@click.option("-n", "--name")
 @pass_config
 @click.pass_context
-def run(ctx, config, machine, args, **kwparams):
+def run(ctx, config, machine, detached, name, args, **kwparams):
     ensure_project_name(config)
     from .lib_control_with_docker import run as lib_run
 
-    lib_run(ctx, config, machine, args, **kwparams)
+    lib_run(
+        ctx, config, machine, args, detached=detached, name=name, **kwparams
+    )
 
 
 @cli.command()
-@click.argument("machine", required=True)
+@click.argument(
+    "machine", required=True, shell_complete=_shell_complete_services
+)
 @click.argument("args", nargs=-1)
 @pass_config
 @click.pass_context
@@ -305,7 +402,7 @@ def runbash(ctx, config, machine, args, **kwparams):
 
 
 @cli.command(name="logs")
-@click.argument("machines", nargs=-1)
+@click.argument("machines", nargs=-1, shell_complete=_shell_complete_machines)
 @click.option("-n", "--lines", required=False, type=int, default=200)
 @click.option("-f", "--follow", is_flag=True)
 @pass_config
@@ -326,6 +423,8 @@ def logall(config, machines, follow, lines):
 )
 @pass_config
 def shell(config, command, queuejobs):
+    print_prod_env(config)
+
     ensure_project_name(config)
     command = "\n".join(command)
     from .lib_control_with_docker import shell as lib_shell
@@ -365,7 +464,9 @@ def _get_project_volumes(config):
         x for x in system_volumes if x.startswith(config.project_name + "_")
     ]
 
-    full_volume_names = list(filter(lambda x: x in system_volumes, full_volume_names))
+    full_volume_names = list(
+        filter(lambda x: x in system_volumes, full_volume_names)
+    )
     return full_volume_names
 
 
@@ -373,7 +474,6 @@ def _get_project_volumes(config):
 @click.option("-f", "--filter")
 @pass_config
 def show_volumes(config, filter):
-    import yaml
     from tabulate import tabulate
     from .lib_control_with_docker import _get_volume_size
 
@@ -394,7 +494,6 @@ def show_volumes(config, filter):
 @pass_config
 @click.pass_context
 def transfer_volume_content(context, config, show_all, filter, no_backup):
-    import shutil
     import inquirer
     from pathlib import Path
     from .lib_control_with_docker import _get_volume_size
@@ -417,14 +516,20 @@ def transfer_volume_content(context, config, show_all, filter, no_backup):
 
     if show_all:
         volumes = list(map(add_size, volumes))
-        volumes_filtered_to_project = [x for x in volumes if config.project_name in x]
+        volumes_filtered_to_project = [
+            x for x in volumes if config.project_name in x
+        ]
 
         volumes1 = volumes
         volumes2 = volumes_filtered_to_project
 
     else:
-        volumes_filtered_to_project = [x for x in volumes if config.project_name in x]
-        volumes_filtered_to_project = list(map(add_size, volumes_filtered_to_project))
+        volumes_filtered_to_project = [
+            x for x in volumes if config.project_name in x
+        ]
+        volumes_filtered_to_project = list(
+            map(add_size, volumes_filtered_to_project)
+        )
 
         volumes1 = volumes_filtered_to_project
         volumes2 = volumes_filtered_to_project
@@ -445,7 +550,9 @@ def transfer_volume_content(context, config, show_all, filter, no_backup):
     questions = [
         inquirer.List(
             "volume",
-            message="Select Destination:".format(config.customs, config.dbname),
+            message="Select Destination:".format(
+                config.customs, config.dbname
+            ),
             choices=volumes2,
         ),
     ]
@@ -459,7 +566,9 @@ def transfer_volume_content(context, config, show_all, filter, no_backup):
     tasks.append(f"rsync -ar --delete-after {source.name} to {dest.name}")
     for i, task in enumerate(tasks):
         click.secho(f"{i}. {task}")
-    answer = inquirer.prompt([inquirer.Confirm("continue", message=("Continue?"))])
+    answer = inquirer.prompt(
+        [inquirer.Confirm("continue", message=("Continue?"))]
+    )
     if not answer["continue"]:
         return
     Commands.invoke(context, "down")
@@ -493,6 +602,48 @@ def transfer_volume_content(context, config, show_all, filter, no_backup):
         ]
         + command
     )
+
+
+@docker.command()
+@pass_config
+@click.pass_context
+def docker_sizes(context, config):
+    from .tools import __dc_out
+    from tabulate import tabulate
+
+    output = __dc_out(config, ["config"])
+    # docker-compose config | grep "image:" | awk '{print $2}'
+    # docker images --format "{{.Repository}}:{{.Tag}} Size: {{.Size}}"
+    import yaml
+
+    image_names = list(
+        map(
+            lambda x: f"{config.project_name}_{x}",
+            yaml.safe_load(output)["services"].keys(),
+        )
+    )
+    out = (
+        subprocess.check_output(
+            [
+                "docker",
+                "images",
+                "--format",
+                "{{.Repository}}:{{.Tag}}\tSize: {{.Size}}",
+            ]
+        )
+        .decode("utf8")
+        .splitlines()
+    )
+    sizes = {}
+    for line in out:
+        name, size = line.split(":", 1)
+        size = size.split("\t")[-1]
+        sizes[name] = size
+    recs = []
+    for name in sorted(image_names, key=lambda x: x[0]):
+        recs.append((name, sizes.get(name, "")))
+
+    click.echo(tabulate(recs, ["Image Name", "Size"]))
 
 
 Commands.register(run)
